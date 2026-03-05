@@ -38,12 +38,73 @@ REMOVE_AFTER_FLAG=""
 KEEP_CONTAINER_FLAG=""
 DELETE_STATE_FLAG=""
 
+discover_latest_tag() {
+  local query_url="$1"
+  local year_filter="$2"
+  local release_type="$3"
+
+  local url="$query_url"
+  local tags=()
+
+  if [[ $VERBOSE -eq 1 ]]; then
+    echo -e "${Yellow}Discovering latest Docker tag for release type ${BYellow}${release_type}${Yellow} with year filter ${BYellow}${year_filter:-none}${Yellow}${Color_Off}" >&2
+  fi
+
+  while [[ -n "$url" ]]; do
+    local json
+    json=$(curl -s "$url") || break
+
+    local names
+    names=("${(@f)$(echo "$json" | jq -r '.results[].name')}")
+
+    local name
+    for name in "${names[@]}"; do
+      [[ -z "$name" ]] && continue
+
+      if [[ -n "$year_filter" && "$name" != ${year_filter}.* ]]; then
+        continue
+      fi
+
+      case "$release_type" in
+        lts)
+          [[ "$name" =~ ^[0-9]{4}\.q[1-4]\.[0-9]+-lts$ ]] || continue
+          ;;
+        u)
+          [[ "$name" =~ ^[0-9]{4}\.q[1-4]\.[0-9]+-u[0-9]+$ ]] || continue
+          ;;
+        qr)
+          [[ "$name" =~ ^[0-9]{4}\.q[1-4]\.[0-9]+$ ]] || continue
+          ;;
+        any|*)
+          [[ "$name" =~ ^[0-9]{4}\.q[1-4]\.[0-9]+(-u[0-9]+|-lts)?$ ]] || continue
+          ;;
+      esac
+
+      tags+=("$name")
+    done
+
+    url=$(echo "$json" | jq -r '.next // empty')
+  done
+
+  if (( ${#tags[@]} == 0 )); then
+    [[ $VERBOSE -eq 1 ]] && echo -e "${Yellow}No matching Docker tags found${Color_Off}" >&2
+    echo ""
+  else
+    local latest_tag
+    latest_tag=$(printf '%s\n' "${tags[@]}" | sort -V | tail -n1)
+    if [[ $VERBOSE -eq 1 ]]; then
+      echo -e "${Yellow}Auto-detected Docker tag: ${BYellow}${latest_tag}${Color_Off}" >&2
+    fi
+    echo "$latest_tag"
+  fi
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -r|--root) shift; [[ -z "$1" ]] && _die "--root requires a path"; ROOT_ARG="$1" ;;
     -t|--tag) shift; [[ -z "$1" ]] && _die "--tag requires a value"; TAG_ARG="$1" ;;
     -c|--container) shift; [[ -z "$1" ]] && _die "--container requires a name"; CONTAINER_ARG="$1" ;;
-    --release-type) shift; [[ -z "$1" ]] && _die "--release-type requires any|u|lts"; case "${1:l}" in any|u|lts) RELEASE_TYPE_ARG="${1:l}" ;; *) _die "--release-type must be any|u|lts";; esac ;;
+    --release-type) shift; [[ -z "$1" ]] && _die "--release-type requires any|u|lts|qr"; case "${1:l}" in any|u|lts|qr) RELEASE_TYPE_ARG="${1:l}" ;; *) _die "--release-type must be any|u|lts|qr";; esac ;;
     --non-interactive) NON_INTERACTIVE=1 ;;
     --db) shift; [[ -z "$1" ]] && _die "--db requires postgresql|mysql|hypersonic"; case "${1:l}" in postgresql|mysql|hypersonic) DB_KIND="${1:l}" ;; *) _die "--db must be postgresql|mysql|hypersonic";; esac ;;
     --hypersonic) DB_KIND="hypersonic" ;;
@@ -67,7 +128,7 @@ while [[ $# -gt 0 ]]; do
       echo "  -t, --tag <tag>               Liferay Docker image tag. Default: latest tag for chosen release type";
       echo "  -r, --root <path>             Project root. Default: ./<tag>";
       echo "  -c, --container <name>        Container name. Default: basename(<root>) with dots replaced by dashes";
-      echo "      --release-type any|u|lts  Tag discovery mode. Default: any";
+      echo "      --release-type any|u|lts|qr  Tag discovery mode. Default: any";
       echo "";
       echo "Database selection:";
       echo "      --db postgresql|mysql|hypersonic  Database choice. Default: prompt; non-interactive defaults to hypersonic unless JDBC opts provided";
@@ -89,25 +150,65 @@ while [[ $# -gt 0 ]]; do
   shift
 done
 
-[[ $VERBOSE -eq 1 ]] && set -x
 
 if [[ -n "$TAG_ARG" ]]; then
   LIFERAY_TAG="$TAG_ARG"
 else
-  API_BASE='https://hub.docker.com/v2/repositories/liferay/dxp/tags?page_size=2048&ordering=name'
-  if [[ -n "$RELEASE_TYPE_ARG" ]]; then RELEASE_TYPE="$RELEASE_TYPE_ARG"; else if [[ $NON_INTERACTIVE -eq 1 ]]; then RELEASE_TYPE=any; else read_config "Release type (any|u|lts)" RELEASE_TYPE any; fi; fi
+  API_BASE='https://hub.docker.com/v2/repositories/liferay/dxp/tags?page_size=200&ordering=name'
+  if [[ -n "$RELEASE_TYPE_ARG" ]]; then
+    RELEASE_TYPE="$RELEASE_TYPE_ARG"
+  else
+    if [[ $NON_INTERACTIVE -eq 1 ]]; then
+      RELEASE_TYPE=any
+    else
+      read_config "Release type (any|u|lts|qr)" RELEASE_TYPE any
+    fi
+  fi
+
   case "${RELEASE_TYPE:l}" in
-    lts) QUERY_URL="$API_BASE&name=-lts"; PATTERN='^[0-9]{4}\.q[0-9]+\.[0-9]+-lts$' ;;
-    u)   QUERY_URL="$API_BASE&name=-u";   PATTERN='^[0-9]{4}\.q[0-9]+\.[0-9]+-u[0-9]+$' ;;
-    *)   QUERY_URL="$API_BASE";           PATTERN='^[0-9]{4}\.q[0-9]+\.[0-9]+(?:-(?:u[0-9]+|lts))?$' ;;
+    lts)
+      QUERY_URL="$API_BASE&name=-lts"
+      ;;
+    u)
+      QUERY_URL="$API_BASE&name=-u"
+      ;;
+    qr)
+      QUERY_URL="$API_BASE"
+      ;;
+    *)
+      QUERY_URL="$API_BASE"
+      ;;
   esac
-  LIFERAY_TAG_DEFAULT=$(curl -s "$QUERY_URL" | jq -r --arg year "$(date +%Y)" --arg pat "$PATTERN" '.results[].name | select(startswith($year)) | select(test($pat))' | sort -V | tail -n1)
-  if [[ -z "$LIFERAY_TAG_DEFAULT" ]]; then LIFERAY_TAG_DEFAULT=$(curl -s "$QUERY_URL" | jq -r --arg pat "$PATTERN" '.results[].name | select(test($pat))' | sort -V | tail -n1); fi
-  if [[ -z "$LIFERAY_TAG_DEFAULT" ]]; then info_custom "${Yellow}Could not auto-detect a Docker tag for release type '${BYellow}${RELEASE_TYPE}${Yellow}'. Please enter one manually."; fi
-  if [[ $NON_INTERACTIVE -eq 1 ]]; then LIFERAY_TAG="$LIFERAY_TAG_DEFAULT"; else read_config "Enter Liferay Docker Tag" LIFERAY_TAG "$LIFERAY_TAG_DEFAULT"; fi
+
+  YEAR_FILTER=$(date +%Y)
+  LIFERAY_TAG_DEFAULT=$(discover_latest_tag "$QUERY_URL" "$YEAR_FILTER" "$RELEASE_TYPE" | grep -E '^[0-9]{4}\.q[1-4]\.[0-9]+' | tail -n1)
+
+  if [[ -z "$LIFERAY_TAG_DEFAULT" ]]; then
+    LIFERAY_TAG_DEFAULT=$(discover_latest_tag "$QUERY_URL" "" "$RELEASE_TYPE" | grep -E '^[0-9]{4}\.q[1-4]\.[0-9]+' | tail -n1)
+  fi
+
+  if [[ -z "$LIFERAY_TAG_DEFAULT" ]]; then
+    info_custom "${Yellow}Could not auto-detect a Docker tag for release type '${BYellow}${RELEASE_TYPE}${Yellow}'. Please enter one manually."
+  fi
+
+  if [[ $NON_INTERACTIVE -eq 1 ]]; then
+    LIFERAY_TAG="$LIFERAY_TAG_DEFAULT"
+  else
+    read_config "Enter Liferay Docker Tag" LIFERAY_TAG "$LIFERAY_TAG_DEFAULT"
+  fi
 fi
 
-if [[ -n "$ROOT_ARG" ]]; then LIFERAY_ROOT="$ROOT_ARG"; else LIFERAY_ROOT_DEFAULT=./${LIFERAY_TAG}; if [[ $NON_INTERACTIVE -eq 1 ]]; then LIFERAY_ROOT="$LIFERAY_ROOT_DEFAULT"; else read_config "Liferay Root" LIFERAY_ROOT "$LIFERAY_ROOT_DEFAULT"; fi; fi
+if [[ -n "$ROOT_ARG" ]]; then
+  LIFERAY_ROOT="$ROOT_ARG"
+else
+  LIFERAY_ROOT_DEFAULT=./${LIFERAY_TAG}
+  if [[ $NON_INTERACTIVE -eq 1 ]]; then
+    LIFERAY_ROOT="$LIFERAY_ROOT_DEFAULT"
+  else
+    read_config "Liferay Root" LIFERAY_ROOT "$LIFERAY_ROOT_DEFAULT"
+  fi
+fi
+
 CONTAINER_NAME=${CONTAINER_ARG:-$(echo "$LIFERAY_ROOT" | sed -e 's:.*/::' -e 's/[\.]/-/g')}
 LIFRAY_IMAGE_TAG=$IMAGE_NAME:$LIFERAY_TAG
 if ! [[ "$LIFERAY_ROOT" =~ ^(\.\/|\/).+$ ]]; then LIFERAY_ROOT=./$LIFERAY_ROOT; fi
@@ -118,6 +219,7 @@ SCRIPT_VOLUME=$LIFERAY_ROOT/scripts
 FILES_VOLUME=$LIFERAY_ROOT/files
 CX_VOLUME=$LIFERAY_ROOT/osgi/client-extensions
 STATE_VOLUME=$LIFERAY_ROOT/osgi/state
+MODULES_VOLUME=$LIFERAY_ROOT/osgi/modules
 BACKUPS_DIR=$LIFERAY_ROOT/backups
 
 info_custom "${Yellow}Deploy folder: ${BYellow}$DEPLOY_VOLUME"
@@ -126,6 +228,7 @@ info_custom "${Yellow}Scripts folder: ${BYellow}$SCRIPT_VOLUME"
 info_custom "${Yellow}Files folder: ${BYellow}$FILES_VOLUME"
 info_custom "${Yellow}Client Extension folder: ${BYellow}$CX_VOLUME"
 info_custom "${Yellow}OSGi state folder: ${BYellow}$STATE_VOLUME"
+info_custom "${Yellow}Modules folder: ${BYellow}$MODULES_VOLUME"
 info_custom "${Yellow}Backups folder: ${BYellow}$BACKUPS_DIR"
 
 docker container inspect "$CONTAINER_NAME" >/dev/null 2>&1
@@ -185,6 +288,7 @@ if [ $? -eq 1 ]; then
     mkdir "$DATA_VOLUME"
     mkdir -p "$CX_VOLUME"
     mkdir -p "$STATE_VOLUME"
+    mkdir -p "$MODULES_VOLUME"
     mkdir -p "$FILES_VOLUME"
     mkdir -p "$SCRIPT_VOLUME"
     mkdir -p "$BACKUPS_DIR"
@@ -200,7 +304,7 @@ if [ $? -eq 1 ]; then
   if [[ "${DISABLE_ZIP64_EXTRA_FIELD_VALIDATION:u}" == "Y" ]]; then DISABLE_ZIP64_FLAG="-e LIFERAY_JVM_OPTS=-Djdk.util.zip.disableZip64ExtraFieldValidation=true"; fi
   if [[ "${USE_HOST_NETWORK:u}" == "Y" ]]; then NETWORK_HOST=--network=host; fi
   info_custom "${Yellow}Creating ${BYellow}$CONTAINER_NAME ${Yellow}with ${BYellow}$LIFRAY_IMAGE_TAG"
-  docker pull "$LIFRAY_IMAGE_TAG" | grep "Status: " | awk 'NF>1{print $NF}' | xargs -I{} docker create -it ${NETWORK_HOST} --name "${CONTAINER_NAME}" -p ${LOCAL_PORT}:8080 ${DISABLE_ZIP64_FLAG} -v "${FILES_VOLUME}:/mnt/liferay/files" -v "${SCRIPT_VOLUME}:/mnt/liferay/scripts" -v "${STATE_VOLUME}:/opt/liferay/osgi/state" -v "${DATA_VOLUME}:/opt/liferay/data" -v "${DEPLOY_VOLUME}:/mnt/liferay/deploy" -v "${CX_VOLUME}:/opt/liferay/osgi/client-extensions" {}
+  docker pull "$LIFRAY_IMAGE_TAG" | grep "Status: " | awk 'NF>1{print $NF}' | xargs -I{} docker create -it ${NETWORK_HOST} --name "${CONTAINER_NAME}" -p ${LOCAL_PORT}:8080 ${DISABLE_ZIP64_FLAG} -v "${FILES_VOLUME}:/mnt/liferay/files" -v "${SCRIPT_VOLUME}:/mnt/liferay/scripts" -v "${STATE_VOLUME}:/opt/liferay/osgi/state" -v "${MODULES_VOLUME}:/opt/liferay/modules" -v "${DATA_VOLUME}:/opt/liferay/data" -v "${DEPLOY_VOLUME}:/mnt/liferay/deploy" -v "${CX_VOLUME}:/opt/liferay/osgi/client-extensions" {}
   docker start -i -a "${CONTAINER_NAME}"
   if [[ "${REMOVE_CONTAINER:u}" == "Y" ]]; then
     info_custom "\n${Yellow}Deleting ${Green}$CONTAINER_NAME"
