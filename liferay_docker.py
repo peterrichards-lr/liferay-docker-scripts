@@ -19,6 +19,8 @@ IMAGE_NAME = "liferay/dxp"
 API_BASE = "https://hub.docker.com/v2/repositories/liferay/dxp/tags?page_size=200&ordering=name"
 META_VERSION = "2"
 MIN_META_VERSION = 2
+PROJECT_META_FILE = ".liferay-docker.meta"
+TAG_PATTERN = r'^\d{4}\.q[1-4]\.\d+(-u\d+|-lts)?$'
 
 # --- UI Helpers ---
 class UI:
@@ -54,10 +56,15 @@ class UI:
 
     @staticmethod
     def ask(prompt, default=None):
-        if default:
-            res = input(f"{UI.WHITE}❓ {prompt} [{UI.GREEN}{default}{UI.WHITE}]: {UI.COLOR_OFF}")
-            return res if res else default
-        return input(f"{UI.WHITE}❓ {prompt}: {UI.COLOR_OFF}")
+        try:
+            if default:
+                res = input(f"{UI.WHITE}❓ {prompt} [{UI.GREEN}{default}{UI.WHITE}]: {UI.COLOR_OFF}")
+                return res if res else default
+            return input(f"{UI.WHITE}❓ {prompt}: {UI.COLOR_OFF}")
+        except KeyboardInterrupt:
+            print("\n")
+            UI.info("Interrupted by user. Exiting...")
+            sys.exit(130)
 
     @staticmethod
     def format_size(size):
@@ -107,16 +114,7 @@ def discover_latest_tag(release_type="any", year_filter=None, verbose=False):
             if year_filter and not name.startswith(year_filter):
                 continue
             
-            is_valid = False
-            if release_type == "lts":
-                is_valid = bool(re.match(r'^\d{4}\.q[1-4]\.\d+-lts$', name))
-            elif release_type == "u":
-                is_valid = bool(re.match(r'^\d{4}\.q[1-4]\.\d+-u\d+$', name))
-            elif release_type == "qr":
-                is_valid = bool(re.match(r'^\d{4}\.q[1-4]\.\d+$', name))
-            else:
-                is_valid = bool(re.match(r'^\d{4}\.q[1-4]\.\d+(-u\d+|-lts)?$', name))
-            
+            is_valid = bool(re.match(TAG_PATTERN, name))
             if is_valid:
                 tags.append(name)
         
@@ -150,6 +148,23 @@ class LiferayManager:
             return cwd
         
         return None
+
+    def find_dxp_roots(self, search_dir=None):
+        search_dir = Path(search_dir or Path.cwd())
+        roots = []
+        for item in search_dir.iterdir():
+            if item.is_dir() and not item.name.startswith('.'):
+                # Heuristic: must have files/ or deploy/
+                if (item / "files").exists() or (item / "deploy").exists():
+                    meta = self.read_meta(item / PROJECT_META_FILE)
+                    version = meta.get("tag")
+                    if not version:
+                        if re.match(TAG_PATTERN, item.name):
+                            version = item.name
+                        else:
+                            version = "unknown"
+                    roots.append({"path": item, "version": version})
+        return sorted(roots, key=lambda x: x["path"].name)
 
     def setup_paths(self, root_path):
         root = Path(root_path).resolve()
@@ -225,28 +240,87 @@ class LiferayManager:
             UI.error(f"Integrity check failed: {e}")
             return False
 
-    def cmd_run(self):
-        tag = self.args.tag
-        if not tag:
-            release_type = self.args.release_type or (UI.ask("Release type (any|u|lts|qr)", "any") if not self.non_interactive else "any")
-            year = datetime.now().strftime("%Y")
-            tag = discover_latest_tag(release_type, year, self.verbose)
-            if not tag:
-                tag = discover_latest_tag(release_type, None, self.verbose)
-            
-            if not self.non_interactive:
-                tag = UI.ask("Enter Liferay Docker Tag", tag)
-            elif not tag:
-                UI.die("Could not auto-detect tag. Please provide --tag.")
+    def check_docker(self):
+        try:
+            # Check if server is reachable
+            run_command(["docker", "version", "--format", "{{.Server.Version}}"], capture_output=True)
+            return True
+        except Exception:
+            return False
 
-        root_default = self.detect_root() or f"./{tag}"
+    def cmd_run(self):
+        if not self.check_docker():
+            UI.die("Docker is not running or not accessible. Please start Docker and try again.")
+
+        if getattr(self.args, 'list', False):
+            roots = self.find_dxp_roots()
+            UI.heading("Available DXP Folders")
+            for i, root in enumerate(roots):
+                print(f"[{i+1}] {root['path'].name} [{UI.CYAN}{root['version']}{UI.COLOR_OFF}]")
+            print(f"[{len(roots)+1}] Create New...")
+            
+            choice = UI.ask("Select folder index", "1")
+            try:
+                idx = int(choice) - 1
+                if idx == len(roots):
+                    self.args.root = None
+                    self.args.tag = None
+                elif 0 <= idx < len(roots):
+                    self.args.root = str(roots[idx]['path'])
+                    if not self.args.tag and roots[idx]['version'] != "unknown":
+                        self.args.tag = roots[idx]['version']
+                else:
+                    UI.die("Invalid selection.")
+            except ValueError:
+                UI.die("Invalid input. Please enter a number.")
+
+        root_path = self.args.root or self.detect_root()
+        project_meta = {}
+        if root_path and Path(root_path).exists():
+            project_meta = self.read_meta(Path(root_path) / PROJECT_META_FILE)
+
+        tag = self.args.tag or project_meta.get("tag")
+        if not tag:
+            if root_path and re.match(TAG_PATTERN, Path(root_path).name):
+                tag = Path(root_path).name
+            
+            if not tag:
+                ans = self.args.release_type or (UI.ask("Release type (any|u|lts|qr) or Enter Tag", "any") if not self.non_interactive else "any")
+                
+                if re.match(TAG_PATTERN, ans):
+                    tag = ans
+                else:
+                    release_type = ans
+                    year = datetime.now().strftime("%Y")
+                    tag = discover_latest_tag(release_type, year, self.verbose)
+                    if not tag:
+                        tag = discover_latest_tag(release_type, None, self.verbose)
+                    
+                    if not self.non_interactive:
+                        tag = UI.ask("Enter Liferay Docker Tag", tag)
+                    elif not tag:
+                        UI.die("Could not auto-detect tag. Please provide --tag.")
+
+        root_default = root_path or f"./{tag}"
         root_path = self.args.root or (UI.ask("Liferay Root", root_default) if not self.non_interactive else root_default)
         paths = self.setup_paths(root_path)
 
-        container_name = self.args.container or Path(root_path).name.replace(".", "-")
+        container_name = self.args.container or project_meta.get("container_name") or Path(root_path).name.replace(".", "-")
         
         inspect = run_command(["docker", "ps", "-a", "--filter", f"name=^{container_name}$", "--format", "{{.Names}}"], check=False)
         
+        db_kind = getattr(self.args, 'db', None) or project_meta.get("db_type")
+        use_host_net = getattr(self.args, 'host_network', None)
+        if use_host_net is None:
+            host_net_meta = project_meta.get("host_network")
+            if host_net_meta is not None: use_host_net = (host_net_meta == "True")
+
+        port = self.args.port or project_meta.get("port")
+        disable_zip64 = getattr(self.args, 'disable_zip64', None)
+        if disable_zip64 is None:
+            zip64_meta = project_meta.get("disable_zip64")
+            if zip64_meta is not None: disable_zip64 = (zip64_meta == "True")
+
         if not inspect or container_name not in inspect.split("\n"):
             UI.heading(f"Initializing {container_name}")
             
@@ -265,7 +339,6 @@ class LiferayManager:
                 rm_container = UI.ask("Remove container afterwards?", "Y") == "Y"
             rm_arg = ["--rm"] if rm_container else []
 
-            db_kind = getattr(self.args, 'db', None)
             if not db_kind and not self.non_interactive:
                 db_kind = UI.ask("Use Hypersonic database?", "Y")
                 db_kind = "hypersonic" if db_kind.upper() == "Y" else None
@@ -320,20 +393,22 @@ class LiferayManager:
                 with open(portal_ext, "a") as f:
                     f.write("\n" + "\n".join(filter(None, jdbc_lines)) + "\n")
 
-            use_host_net = getattr(self.args, 'host_network', False)
-            if not use_host_net and not self.non_interactive:
+            if use_host_net is None and not self.non_interactive:
                 use_host_net = UI.ask("Use host network?", "N") == "Y"
+            elif use_host_net is None:
+                use_host_net = False
 
             net_args = []
             if use_host_net:
                 net_args = ["--network", "host"]
             else:
-                port = self.args.port or (int(UI.ask("Local Port", "8080")) if not self.non_interactive else 8080)
+                port = port or (int(UI.ask("Local Port", "8080")) if not self.non_interactive else 8080)
                 net_args = ["-p", f"{port}:8080"]
 
-            disable_zip64 = getattr(self.args, 'disable_zip64', False)
-            if not disable_zip64 and not self.non_interactive:
+            if disable_zip64 is None and not self.non_interactive:
                 disable_zip64 = UI.ask("Disable ZIP64 Extra Field Validation?", "N") == "Y"
+            elif disable_zip64 is None:
+                disable_zip64 = False
             
             env_args = []
             if disable_zip64:
@@ -357,11 +432,6 @@ class LiferayManager:
             ]
             run_command(docker_cmd)
             UI.success(f"Container created: {container_name}")
-            run_command(["docker", "start", "-i", "-a", container_name], capture_output=False)
-            
-            if not rm_container:
-                UI.info(f"Stopping {container_name}")
-                run_command(["docker", "stop", container_name], check=False)
         else:
             UI.heading(f"Resuming {container_name}")
             
@@ -377,23 +447,34 @@ class LiferayManager:
                 UI.info("Clearing OSGi state...")
                 shutil.rmtree(paths["state"], ignore_errors=True)
                 paths["state"].mkdir(parents=True)
-            
-            if getattr(self.args, 'follow', False):
-                subprocess.Popen(["docker", "start", container_name])
-                UI.info("Following logs (Ctrl+C to stop container)...")
-                try:
-                    run_command(["docker", "logs", "-f", container_name], capture_output=False)
-                except KeyboardInterrupt:
-                    pass
-            else:
-                run_command(["docker", "start", "-i", "-a", container_name], capture_output=False)
-            
-            if rm_container:
-                UI.info(f"Deleting {container_name}")
-                run_command(["docker", "rm", "--force", container_name], check=False)
-            else:
-                UI.info(f"Stopping {container_name}")
-                run_command(["docker", "stop", container_name], check=False)
+
+        project_meta.update({
+            "tag": tag,
+            "container_name": container_name,
+            "db_type": db_kind or "hypersonic",
+            "port": str(port) if port else "8080",
+            "host_network": str(use_host_net),
+            "disable_zip64": str(disable_zip64),
+            "last_run": datetime.now().isoformat()
+        })
+        self.write_meta(paths["root"] / PROJECT_META_FILE, project_meta)
+
+        if getattr(self.args, 'follow', False):
+            subprocess.Popen(["docker", "start", container_name])
+            UI.info("Following logs (Ctrl+C to stop container)...")
+            try:
+                run_command(["docker", "logs", "-f", container_name], capture_output=False)
+            except KeyboardInterrupt:
+                pass
+        else:
+            run_command(["docker", "start", "-i", "-a", container_name], capture_output=False)
+        
+        if rm_container:
+            UI.info(f"Deleting {container_name}")
+            run_command(["docker", "rm", "--force", container_name], check=False)
+        else:
+            UI.info(f"Stopping {container_name}")
+            run_command(["docker", "stop", container_name], check=False)
 
     def cmd_list(self):
         root_path = self.detect_root() or os.getcwd()
@@ -418,7 +499,6 @@ class LiferayManager:
             date = b.name.replace("-", " ")[:19]
             fmt = meta.get("format", "standard")
             
-            # Calculate total size
             total_size = sum(f.stat().st_size for f in b.glob('*') if f.is_file())
             size_str = UI.format_size(total_size)
             
@@ -443,9 +523,8 @@ class LiferayManager:
         prefix = self.args.prefix + "-" if self.args.prefix else ""
         snap_dir = paths["backups"] / f"{prefix}{timestamp}"
         
-        # Disk Space check (crude)
         total, used, free = shutil.disk_usage(paths["root"])
-        if free < 1024 * 1024 * 500: # 500MB warning
+        if free < 1024 * 1024 * 500:
             UI.info("⚠️ Low disk space detected. Backup might fail.")
 
         snap_dir.mkdir(parents=True, exist_ok=True)
@@ -471,7 +550,6 @@ class LiferayManager:
         comp_ext = ".gz" if comp == "gzip" else (".xz" if comp == "xz" else "")
         tar_mode = "w:gz" if comp == "gzip" else ("w:xz" if comp == "xz" else "w")
 
-        # Files archive
         if not getattr(self.args, 'db_only', False):
             UI.heading("Archiving Files")
             if format_choice == "liferay-cloud":
@@ -489,7 +567,6 @@ class LiferayManager:
                         if folder_path.exists(): tar.add(folder_path, arcname=folder)
             meta["files_archive"] = arc_path.name
 
-        # DB Dump
         jdbc = self.get_jdbc_params(paths["files"])
         snap_type = "hypersonic"
         if jdbc.get("jdbc.default.url") and not getattr(self.args, 'files_only', False):
@@ -536,7 +613,6 @@ class LiferayManager:
         meta["type"] = snap_type
         self.write_meta(snap_dir / "meta", meta)
 
-        # Verification
         if getattr(self.args, 'verify', False):
             UI.heading("Verification")
             success = True
@@ -546,7 +622,6 @@ class LiferayManager:
 
         if stop_needed: run_command(["docker", "start", container_name])
         
-        # Retention
         if self.args.retention:
             UI.info(f"Pruning backups (keeping {self.args.retention})...")
             all_bks = sorted([d for d in paths["backups"].iterdir() if d.is_dir() and (not prefix or d.name.startswith(prefix))], key=lambda x: x.name, reverse=True)
@@ -608,12 +683,10 @@ class LiferayManager:
             tars = list(choice.glob("files.tar*"))
             if tars: meta["files_archive"] = tars[0].name
         
-        # Version check
         meta_ver = int(meta.get("meta_version", 1))
         if meta_ver < MIN_META_VERSION and not getattr(self.args, 'allow_legacy', False):
             UI.die(f"Backup version {meta_ver} is unsupported. Use --allow-legacy.")
 
-        # Restore Files
         arc_name = meta.get("files_archive") or ( "volume.tgz" if meta.get("format") == "liferay-cloud" else None )
         if arc_name:
             arc = choice / arc_name
@@ -626,7 +699,6 @@ class LiferayManager:
                     with tarfile.open(arc, "r:*") as tar:
                         tar.extractall(path=paths["root"])
 
-        # Restore DB
         dump_name = meta.get("db_dump") or ( "database.gz" if meta.get("format") == "liferay-cloud" else None )
         if dump_name:
             dump = choice / dump_name
@@ -679,10 +751,12 @@ class LiferayManager:
 # --- Main CLI ---
 def main():
     parser = argparse.ArgumentParser(description="Liferay DXP Docker Manager (Python)")
+    parser.add_argument("--list", action="store_true", help="List available DXP folders")
     subparsers = parser.add_subparsers(dest="command", help="Command to run")
 
     # Run command
     run_parser = subparsers.add_parser("run", help="Run Liferay DXP container")
+    run_parser.add_argument("--list", action="store_true", help="List available DXP folders")
     run_parser.add_argument("-t", "--tag", help="Liferay Docker image tag")
     run_parser.add_argument("-r", "--root", help="Project root path")
     run_parser.add_argument("-c", "--container", help="Container name")
@@ -742,6 +816,10 @@ def main():
     rest_parser.add_argument("--verbose", action="store_true")
 
     args = parser.parse_args()
+    
+    if getattr(args, 'list', False) and not args.command:
+        args.command = "run"
+
     if not args.command:
         parser.print_help()
         return
@@ -753,4 +831,9 @@ def main():
     elif args.command == "restore": manager.cmd_restore()
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n")
+        UI.info("Interrupted by user. Exiting...")
+        sys.exit(130)
