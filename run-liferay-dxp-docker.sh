@@ -9,17 +9,16 @@ Red='\033[0;31m'
 BRed='\033[1;31m'
 Cyan='\033[0;36m'
 
-info() { [[ -n $* ]] && echo -e "${Yellow}$1${Color_Off}"; }
+info() { [[ -n $* ]] && echo -e "${Yellow}ℹ $1${Color_Off}"; }
 info_custom() { [[ -n $* ]] && echo -e "$1${Color_Off}"; }
-error() { echo -e "${BRed}Error:${Color_Off} $*" 1>&2; }
+error() { echo -e "${BRed}❌ Error:${Color_Off} $*" 1>&2; }
 _die() { error "$*"; exit 1; }
-read_config() { if [[ "$NON_INTERACTIVE" == 1 ]]; then typeset -g "$2"="$3"; return; fi; if [[ -n $* ]]; then local ANSWER; echo -n -e "${White}$1 [${Green}$3${White}]: ${Color_Off}"; read -r ANSWER; typeset -g "$2"="${ANSWER:-$3}"; fi }
-read_input()  { if [[ "$NON_INTERACTIVE" == 1 ]]; then typeset -g "$2"="$3"; return; fi; if [[ -n $* ]]; then local ANSWER; echo -n -e "${White}$1: ${Color_Off}"; read -r ANSWER; typeset -g "$2"="${ANSWER}"; fi }
-read_password(){ if [[ "$NON_INTERACTIVE" == 1 ]]; then typeset -g "$2"="$3"; return; fi; if [[ -n $* ]]; then local ANSWER; echo -n -e "${White}$1: ${Color_Off}"; read -rs ANSWER; echo -e ""; typeset -g "$2"="${ANSWER}"; fi }
+read_config() { if [[ "$NON_INTERACTIVE" == 1 ]]; then typeset -g "$2"="$3"; return; fi; if [[ -n $* ]]; then local ANSWER; echo -n -e "${White}❓ $1 [${Green}$3${White}]: ${Color_Off}"; read -r ANSWER; typeset -g "$2"="${ANSWER:-$3}"; fi }
+read_input()  { if [[ "$NON_INTERACTIVE" == 1 ]]; then typeset -g "$2"="$3"; return; fi; if [[ -n $* ]]; then local ANSWER; echo -n -e "${White}❓ $1: ${Color_Off}"; read -r ANSWER; typeset -g "$2"="${ANSWER}"; fi }
+read_password(){ if [[ "$NON_INTERACTIVE" == 1 ]]; then typeset -g "$2"="$3"; return; fi; if [[ -n $* ]]; then local ANSWER; echo -n -e "${White}❓ $1: ${Color_Off}"; read -rs ANSWER; echo -e ""; typeset -g "$2"="${ANSWER}"; fi }
 
 if ! docker info >/dev/null 2>&1; then
-  echo -e "${BRed}❌ Error:${Color_Off} Docker is not running or not accessible. Please start Docker and try again." >&2
-  exit 1
+  _die "Docker is not running or not accessible. Please start Docker and try again."
 fi
 
 IMAGE_NAME=liferay/dxp
@@ -79,7 +78,7 @@ discover_latest_tag() {
   local tags=()
 
   if [[ $VERBOSE -eq 1 ]]; then
-    echo -e "${Yellow}Discovering latest Docker tag for release type ${BYellow}${release_type}${Yellow} with year filter ${BYellow}${year_filter:-none}${Yellow}${Color_Off}" >&2
+    echo -e "${Yellow}ℹ Discovering latest Docker tag for release type ${BYellow}${release_type}${Yellow} with year filter ${BYellow}${year_filter:-none}${Yellow}${Color_Off}" >&2
   fi
 
   while [[ -n "$url" ]]; do
@@ -119,13 +118,13 @@ discover_latest_tag() {
   done
 
   if (( ${#tags[@]} == 0 )); then
-    [[ $VERBOSE -eq 1 ]] && echo -e "${Yellow}No matching Docker tags found${Color_Off}" >&2
+    [[ $VERBOSE -eq 1 ]] && echo -e "${Yellow}ℹ No matching Docker tags found${Color_Off}" >&2
     echo ""
   else
     local latest_tag
     latest_tag=$(printf '%s\n' "${tags[@]}" | sort -V | tail -n1)
     if [[ $VERBOSE -eq 1 ]]; then
-      echo -e "${Yellow}Auto-detected Docker tag: ${BYellow}${latest_tag}${Color_Off}" >&2
+      echo -e "${Yellow}ℹ Auto-detected Docker tag: ${BYellow}${latest_tag}${Color_Off}" >&2
     fi
     echo "$latest_tag"
   fi
@@ -184,10 +183,6 @@ while [[ $# -gt 0 ]]; do
   shift
 done
 
-if ! docker info >/dev/null 2>&1; then
-  _die "Docker is not running or not accessible. Please start Docker and try again."
-fi
-
 if [[ $RUN_LIST -eq 1 ]]; then
   folders=()
   versions=()
@@ -201,13 +196,15 @@ if [[ $RUN_LIST -eq 1 ]]; then
        fi
     fi
   done
-  
-  info_custom "${BYellow}=== Available DXP Folders ==="
-  for i in {1..${#folders[@]}}; do
-    info_custom "${White}[$i] ${folders[$i]} [${Cyan}${versions[$i]}${White}]"
-  done
+
+  info_custom "${BYELLOW}=== Available DXP Folders ==="
+  if (( ${#folders[@]} > 0 )); then
+    for i in {1..${#folders[@]}}; do
+      info_custom "${White}[$i] ${folders[$i]} [${Cyan}${versions[$i]}${White}]"
+    done
+  fi
   info_custom "${White}[$((${#folders[@]} + 1))] Create New..."
-  
+
   read_config "Select folder index" CHOICE_IDX 1
   if [[ "$CHOICE_IDX" -gt 0 && "$CHOICE_IDX" -le ${#folders[@]} ]]; then
     LIFERAY_ROOT="${folders[$CHOICE_IDX]}"
@@ -304,7 +301,7 @@ fi
 
 # Ensure volumes and metadata folder
 if [[ ! -d "$LIFERAY_ROOT" ]]; then
-  info "${Yellow}Creating ${BYellow}volume ${Yellow}folders"
+  info_custom "${Yellow}ℹ Creating ${BYellow}volume ${Yellow}folders"
   mkdir -p "$LIFERAY_ROOT/deploy" && cp ./7.4-common/*activationkeys.xml "$LIFERAY_ROOT/deploy"/ 2>/dev/null
   mkdir -p "$LIFERAY_ROOT/data"
   mkdir -p "$LIFERAY_ROOT/osgi/client-extensions"
@@ -328,9 +325,9 @@ BACKUPS_DIR=$LIFERAY_ROOT/backups
 docker container inspect "$CONTAINER_NAME" >/dev/null 2>&1
 
 if [ $? -eq 1 ]; then
-  info_custom "${Green}$CONTAINER_NAME ${White}does not exist"
+  info_custom "${BYELLOW}=== Initializing $CONTAINER_NAME ==="
   if [[ -n "$REMOVE_AFTER_FLAG" ]]; then REMOVE_CONTAINER=Y; elif [[ -n "$KEEP_CONTAINER_FLAG" ]]; then REMOVE_CONTAINER=N; else read_config "Remove container afterwards" REMOVE_CONTAINER Y; fi
-  
+
   # DB Resolution
   if [[ -n "$DB_KIND" ]]; then 
     LIFERAY_DATABASE="$DB_KIND"
@@ -385,7 +382,7 @@ if [ $? -eq 1 ]; then
     USE_HOST_NETWORK=${META_HOSTNET:-"False"}
     if [[ "$USE_HOST_NETWORK" == "False" && $NON_INTERACTIVE -eq 0 ]]; then read_config "Use host network" UNET N; if [[ "${UNET:u}" == "Y" ]]; then USE_HOST_NETWORK=True; fi; fi
   fi
-  
+
   # Port
   LOCAL_PORT=${PORT_ARG:-${META_PORT:-8080}}
   if [[ "$USE_HOST_NETWORK" != "True" && $NON_INTERACTIVE -eq 0 && -z "$PORT_ARG" && -z "$META_PORT" ]]; then read_config "Local Port" LOCAL_PORT 8080; fi
@@ -400,10 +397,10 @@ if [ $? -eq 1 ]; then
   if [[ "$USE_HOST_NETWORK" == "True" ]]; then NETWORK_ARGS="--network=host"; else NETWORK_ARGS="-p ${LOCAL_PORT}:8080"; fi
 
   LIFRAY_IMAGE_TAG=$IMAGE_NAME:$LIFERAY_TAG
-  info_custom "${Yellow}Creating ${BYellow}$CONTAINER_NAME ${Yellow}with ${BYellow}$LIFRAY_IMAGE_TAG"
+  info_custom "${Yellow}ℹ Pulling ${BYellow}$LIFRAY_IMAGE_TAG"
   docker pull "$LIFRAY_IMAGE_TAG"
   docker create -it ${NETWORK_ARGS} --name "${CONTAINER_NAME}" ${DISABLE_ZIP64_FLAG} -v "${FILES_VOLUME}:/mnt/liferay/files" -v "${SCRIPT_VOLUME}:/mnt/liferay/scripts" -v "${STATE_VOLUME}:/opt/liferay/osgi/state" -v "${MODULES_VOLUME}:/opt/liferay/modules" -v "${DATA_VOLUME}:/opt/liferay/data" -v "${DEPLOY_VOLUME}:/mnt/liferay/deploy" -v "${CX_VOLUME}:/opt/liferay/osgi/client-extensions" "$LIFRAY_IMAGE_TAG"
-  
+
   # Save Metadata
   write_meta "$LIFERAY_ROOT/$PROJECT_META_FILE" "tag" "$LIFERAY_TAG"
   write_meta "$LIFERAY_ROOT/$PROJECT_META_FILE" "port" "$LOCAL_PORT"
@@ -414,15 +411,16 @@ if [ $? -eq 1 ]; then
   write_meta "$LIFERAY_ROOT/$PROJECT_META_FILE" "last_run" "$(date -Iseconds)"
 
   docker start -i -a "${CONTAINER_NAME}"
-  if [[ "${REMOVE_CONTAINER:u}" == "Y" ]]; then docker rm --force "$CONTAINER_NAME" >/dev/null 2>&1; else docker stop "$CONTAINER_NAME" >/dev/null 2>&1; fi
+  if [[ "${REMOVE_CONTAINER:u}" == "Y" ]]; then info "Deleting $CONTAINER_NAME"; docker rm --force "$CONTAINER_NAME" >/dev/null 2>&1; else info "Stopping $CONTAINER_NAME"; docker stop "$CONTAINER_NAME" >/dev/null 2>&1; fi
 else
-  info_custom "${Green}$CONTAINER_NAME ${White}already exists"
+  info_custom "${BYELLOW}=== Resuming $CONTAINER_NAME ==="
+  if [[ -n "$REMOVE_AFTER_FLAG" ]]; then REMOVE_CONTAINER=Y; elif [[ -n "$KEEP_CONTAINER_FLAG" ]]; then REMOVE_CONTAINER=N; else read_config "Remove container afterwards" REMOVE_CONTAINER N; fi
   if [[ -n "$DELETE_STATE_FLAG" ]]; then RS=Y; else read_config "Delete OSGi state folder" RS Y; fi
-  if [[ "${RS:u}" == "Y" ]]; then rm -R "$STATE_VOLUME" 2>/dev/null; mkdir -p "$STATE_VOLUME"; fi
-  
+  if [[ "${RS:u}" == "Y" ]]; then info "Clearing OSGi state..."; rm -R "$STATE_VOLUME" 2>/dev/null; mkdir -p "$STATE_VOLUME"; fi
+
   # Update last_run
   write_meta "$LIFERAY_ROOT/$PROJECT_META_FILE" "last_run" "$(date -Iseconds)"
-  
+
   docker start -i -a "${CONTAINER_NAME}"
-  if [[ -n "$REMOVE_AFTER_FLAG" ]]; then docker rm --force "$CONTAINER_NAME" >/dev/null 2>&1; else docker stop "$CONTAINER_NAME" >/dev/null 2>&1; fi
+  if [[ "${REMOVE_CONTAINER:u}" == "Y" ]]; then info "Deleting $CONTAINER_NAME"; docker rm --force "$CONTAINER_NAME" >/dev/null 2>&1; else info "Stopping $CONTAINER_NAME"; docker stop "$CONTAINER_NAME" >/dev/null 2>&1; fi
 fi
