@@ -136,6 +136,17 @@ class LiferayManager:
         self.args = args
         self.verbose = getattr(args, 'verbose', False)
         self.non_interactive = getattr(args, 'non_interactive', False)
+        
+        # Ensure all 'run' command attributes are present to avoid AttributeError
+        # when forcing command='run' via top-level --list
+        run_attrs = [
+            'tag', 'root', 'container', 'follow', 'release_type', 'db', 
+            'jdbc_username', 'jdbc_password', 'recreate_db', 'port', 
+            'host_network', 'disable_zip64', 'delete_state', 'remove_after'
+        ]
+        for attr in run_attrs:
+            if not hasattr(self.args, attr):
+                setattr(self.args, attr, None)
 
     def detect_root(self):
         # 1. Explicit arg
