@@ -226,7 +226,7 @@ Runs a Liferay Portal Docker container with default or specified options.
 | `--jdbc-password <pass>` | DB password (external DB) | prompted |
 | `--recreate-db` | Drop and recreate DB if it exists | off |
 | `--host-network` / `--no-host-network` | Use or avoid host networking | disabled |
-| `--disable-zip64` / `--enable-zip64` | Toggle Zip64 extra field validation | disabled |
+| `--disable-zip64` | Disable Zip64 extra field validation | enabled |
 | `--remove-after` / `--keep-container` | Remove the container after exit or keep it | keep |
 | `--delete-state` | Delete `osgi/state` before starting if container exists | off |
 | `--non-interactive` | No prompts; apply defaults | off |
@@ -257,7 +257,7 @@ Runs a Liferay DXP Docker container with default or specified options.
 | `--jdbc-password <pass>` | DB password (external DB) | prompted |
 | `--recreate-db` | Drop and recreate DB if it exists | off |
 | `--host-network` / `--no-host-network` | Use or avoid host networking | disabled |
-| `--disable-zip64` / `--enable-zip64` | Toggle Zip64 extra field validation | disabled |
+| `--disable-zip64` | Disable Zip64 extra field validation | enabled |
 | `--remove-after` / `--keep-container` | Remove the container after exit or keep it | keep |
 | `--delete-state` | Delete `osgi/state` before starting if container exists | off |
 | `--non-interactive` | No prompts; apply defaults | off |
