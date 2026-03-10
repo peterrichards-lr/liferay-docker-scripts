@@ -17,6 +17,8 @@ This repository contains automation tools for managing Liferay DXP instances usi
   - `files/`: Configuration files (e.g., `portal-ext.properties`).
   - `data/`: Persistent Liferay data (document library, etc.).
   - `osgi/`: Client extensions and state.
+## UI & Interaction Consistency
+- **Background Startup**: Containers start in detached mode by default. Users must use `--follow` or `-f` to attach to logs.
 - **UI Consistency**: Use the `UI` helper class in Python and `terminal-colors.txt` in shell scripts for consistent logging.
 
 ## Definition of Done

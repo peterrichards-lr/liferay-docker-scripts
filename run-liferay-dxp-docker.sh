@@ -15,7 +15,7 @@ error() { echo -e "${BRed}❌ Error:${Color_Off} $*" 1>&2; }
 _die() { error "$*"; exit 1; }
 read_config() { if [[ "$NON_INTERACTIVE" == 1 ]]; then typeset -g "$2"="$3"; return; fi; if [[ -n $* ]]; then local ANSWER; echo -n -e "${White}❓ $1 [${Green}$3${White}]: ${Color_Off}"; read -r ANSWER; typeset -g "$2"="${ANSWER:-$3}"; fi }
 read_input()  { if [[ "$NON_INTERACTIVE" == 1 ]]; then typeset -g "$2"="$3"; return; fi; if [[ -n $* ]]; then local ANSWER; echo -n -e "${White}❓ $1: ${Color_Off}"; read -r ANSWER; typeset -g "$2"="${ANSWER}"; fi }
-read_password(){ if [[ "$NON_INTERACTIVE" == 1 ]]; then typeset -g "$2"="$3"; return; fi; if [[ -n $* ]]; then local ANSWER; echo -n -e "${White}❓ $1: ${Color_Off}"; read -rs ANSWER; echo -e ""; typeset -g "$2"="${ANSWER}"; fi }
+read_password() { if [[ "$NON_INTERACTIVE" == 1 ]]; then typeset -g "$2"="$3"; return; fi; if [[ -n $* ]]; then local ANSWER; echo -n -e "${White}❓ $1: ${Color_Off}"; read -rs ANSWER; echo -e ""; typeset -g "$2"="${ANSWER}"; fi }
 
 if ! docker info >/dev/null 2>&1; then
   _die "Docker is not running or not accessible. Please start Docker and try again."
@@ -27,7 +27,7 @@ PROJECT_META_FILE=".liferay-docker.meta"
 NON_INTERACTIVE=0
 QUIET=0
 VERBOSE=0
-RUN_LIST=0
+RUN_SELECT=0
 ROOT_ARG=""
 TAG_ARG=""
 CONTAINER_ARG=""
@@ -38,11 +38,14 @@ JDBC_PASSWORD_ARG=""
 RECREATE_DB_FLAG=""
 HOST_NETWORK_FLAG=""
 NO_HOST_NETWORK_FLAG=""
+HOST_NAME_ARG=""
+ES_PORT_ARG=""
 DISABLE_ZIP64_FLAG_EXPL=""
 PORT_ARG=""
 REMOVE_AFTER_FLAG=""
 KEEP_CONTAINER_FLAG=""
 DELETE_STATE_FLAG=""
+FOLLOW_FLAG=0
 
 read_meta() {
   local file="$1"
@@ -129,9 +132,37 @@ discover_latest_tag() {
   fi
 }
 
+normalize_jdbc() {
+  local url="$1"
+  [[ -z "$url" ]] && return
+  # Use python for robust URL parsing/normalization
+  python3 -c "
+import re
+url = '$url'
+pattern = r'^jdbc:(postgresql|mysql|mariadb)://([^:/]+)(?::(\d+))?/([^/?]+)'
+match = re.match(pattern, url)
+if match:
+    driver, host, port, db_name = match.groups()
+    if host in ['localhost', 'host.docker.internal']: host = '127.0.0.1'
+    if not port: port = '5432' if driver == 'postgresql' else '3306'
+    print(f'{driver}|{host}|{port}|{db_name}')
+" 2>/dev/null
+}
+
+print_macos_alias_advice() {
+  local ip="$1"
+  if [[ "$(uname)" == "Darwin" ]]; then
+    echo -e "\n${BRed}OSX DETECTED:${Color_Off} You must alias this IP to your loopback interface."
+    echo -e "Run the following command in your terminal:"
+    echo -e "${Cyan}sudo ifconfig lo0 alias $ip up${Color_Off}\n"
+  else
+    echo -e "\nEnsure your network interface is configured to handle $ip."
+  fi
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --list) RUN_LIST=1 ;;
+    --select) RUN_SELECT=1 ;;
     -r|--root) shift; [[ -z "$1" ]] && _die "--root requires a path"; ROOT_ARG="$1" ;;
     -t|--tag) shift; [[ -z "$1" ]] && _die "--tag requires a value"; TAG_ARG="$1" ;;
     -c|--container) shift; [[ -z "$1" ]] && _die "--container requires a name"; CONTAINER_ARG="$1" ;;
@@ -144,18 +175,21 @@ while [[ $# -gt 0 ]]; do
     --recreate-db) RECREATE_DB_FLAG=1 ;;
     --host-network) HOST_NETWORK_FLAG=1 ;;
     --no-host-network) NO_HOST_NETWORK_FLAG=1 ;;
+    --host-name) shift; [[ -z "$1" ]] && _die "--host-name requires a value"; HOST_NAME_ARG="$1" ;;
+    --es-port) shift; [[ -z "$1" || "$1" != <-> ]] && _die "--es-port requires a number"; ES_PORT_ARG="$1" ;;
     --disable-zip64) DISABLE_ZIP64_FLAG_EXPL=1 ;;
     -p|--port) shift; [[ -z "$1" || "$1" != <-> ]] && _die "--port requires a number"; PORT_ARG="$1" ;;
     --remove-after) REMOVE_AFTER_FLAG=1 ;;
     --keep-container) KEEP_CONTAINER_FLAG=1 ;;
     --delete-state) DELETE_STATE_FLAG=1 ;;
+    -f|--follow) FOLLOW_FLAG=1 ;;
     --quiet) QUIET=1 ;;
     --verbose) VERBOSE=1 ;;
     -h|--help)
       echo "Usage: $0 [options]";
       echo "";
       echo "Core paths and image:";
-      echo "      --list                    List available DXP folders and select one";
+      echo "      --select                  Browse and select managed DXP folders";
       echo "  -t, --tag <tag>               Liferay Docker image tag. Default: latest tag for chosen release type";
       echo "  -r, --root <path>             Project root. Default: ./<tag>";
       echo "  -c, --container <name>        Container name. Default: basename(<root>) with dots replaced by dashes";
@@ -170,8 +204,11 @@ while [[ $# -gt 0 ]]; do
       echo "Runtime behavior:";
       echo "  -p, --port <8080>             Local HTTP port mapping. Default: 8080";
       echo "      --host-network|--no-host-network  Use or avoid host networking. Default: disabled";
+      echo "      --host-name <hostname>    Virtual hostname for the instance. Default: localhost";
+      echo "      --es-port <port>          Elasticsearch sidecar HTTP port. Default: 9200";
       echo "      --disable-zip64           Disable Zip64 extra field validation. Default: enabled";
-      echo "      --remove-after|--keep-container   Remove container after run or keep it. Default: keep when created, stop when kept";
+      echo "  -f, --follow                  Start container and follow logs (attach). Default: background";
+      echo "      --remove-after|--keep-container   Remove container after run or keep it. Default: keep when created, background start when kept";
       echo "      --delete-state             When container already exists, delete osgi/state before starting";
       echo "      --non-interactive         Do not prompt; apply defaults and provided flags";
       echo "      --quiet | --verbose       Adjust logging";
@@ -181,13 +218,13 @@ while [[ $# -gt 0 ]]; do
   shift
 done
 
-if [[ $RUN_LIST -eq 1 ]]; then
+if [[ $RUN_SELECT -eq 1 ]]; then
   folders=()
   versions=()
   for d in */; do
     d=${d%/}
-    if [[ -d "$d/files" || -d "$d/deploy" ]]; then
-       if [[ "$d" != "7.4-common" && "$d" != .* ]]; then
+    if [[ -d "$d/files" || -d "$d/deploy" || -f "$d/$PROJECT_META_FILE" ]]; then
+       if [[ "$d" != "common" && "$d" != .* ]]; then
          folders+=("$d")
          ver=$(read_meta "$d/$PROJECT_META_FILE" "tag")
          versions+=("${ver:-unknown}")
@@ -234,6 +271,109 @@ if [[ -n "$LIFERAY_ROOT" && -d "$LIFERAY_ROOT" ]]; then
   META_DB=$(read_meta "$LIFERAY_ROOT/$PROJECT_META_FILE" "db_type")
   META_CONTAINER=$(read_meta "$LIFERAY_ROOT/$PROJECT_META_FILE" "container_name")
   META_HOSTNET=$(read_meta "$LIFERAY_ROOT/$PROJECT_META_FILE" "host_network")
+  META_HOSTNAME=$(read_meta "$LIFERAY_ROOT/$PROJECT_META_FILE" "host_name")
+  META_ES_PORT=$(read_meta "$LIFERAY_ROOT/$PROJECT_META_FILE" "es_port")
+fi
+
+# Early Conflict & Hostname Check
+REQUESTED_PORT=${PORT_ARG:-${META_PORT:-8080}}
+REQUESTED_HOSTNAME=${HOST_NAME_ARG:-${META_HOSTNAME:-localhost}}
+REQUESTED_ES_PORT=${ES_PORT_ARG:-${META_ES_PORT:-9200}}
+
+# Resolve IP early for conflict checks
+if [[ "$REQUESTED_HOSTNAME" == "localhost" ]]; then
+  REQUESTED_IP="127.0.0.1"
+else
+  REQUESTED_IP=$(python3 -c "import socket; print(socket.gethostbyname('$REQUESTED_HOSTNAME'))" 2>/dev/null)
+  [[ -z "$REQUESTED_IP" ]] && REQUESTED_IP="127.0.0.1"
+fi
+
+# Get current JDBC URL and normalize it
+RAW_JDBC=$(grep "^jdbc.default.url=" "$LIFERAY_ROOT/files/portal-ext.properties" 2>/dev/null | cut -d'=' -f2-)
+CURR_JDBC_NORM=$(normalize_jdbc "$RAW_JDBC")
+
+for d in */; do
+  d=${d%/}
+  [[ "$d" == "common" || "$d" == .* || "./$d" == "$LIFERAY_ROOT" ]] && continue
+  
+  M_FILE="$d/$PROJECT_META_FILE"
+  [[ ! -f "$M_FILE" ]] && continue
+  
+  M_CONT=$(read_meta "$M_FILE" "container_name")
+  M_PORT=$(read_meta "$M_FILE" "port")
+  M_HOST=$(read_meta "$M_FILE" "host_name")
+  M_EP=$(read_meta "$M_FILE" "es_port")
+  
+  # Resolve IP of other container
+  M_IP=$(python3 -c "import socket; print(socket.gethostbyname('${M_HOST:-localhost}'))" 2>/dev/null)
+  [[ -z "$M_IP" ]] && M_IP="127.0.0.1"
+
+  # Check if container is likely running
+  if docker ps --filter "name=^${M_CONT}$" --format "{{.Names}}" | grep -q "^${M_CONT}$"; then
+    if [[ "$REQUESTED_PORT" == "$M_PORT" && "$REQUESTED_IP" == "$M_IP" ]]; then
+      error "Port $REQUESTED_PORT on $REQUESTED_IP is already in use by running container '$M_CONT'"
+      if [[ $NON_INTERACTIVE -eq 1 ]]; then exit 1; fi
+      read_config "Enter a different Local Port" REQUESTED_PORT $(($REQUESTED_PORT + 1))
+    fi
+    if [[ "$REQUESTED_HOSTNAME" != "localhost" && "$REQUESTED_HOSTNAME" == "$M_HOST" ]]; then
+      error "Hostname '$REQUESTED_HOSTNAME' is already in use by running container '$M_CONT'"
+      if [[ $NON_INTERACTIVE -eq 1 ]]; exit 1; fi
+      read_config "Enter a different Hostname" REQUESTED_HOSTNAME "alt-$REQUESTED_HOSTNAME"
+      # Re-resolve IP if hostname changed
+      REQUESTED_IP=$(python3 -c "import socket; print(socket.gethostbyname('$REQUESTED_HOSTNAME'))" 2>/dev/null)
+      [[ -z "$REQUESTED_IP" ]] && REQUESTED_IP="127.0.0.1"
+    fi
+    if [[ "$REQUESTED_ES_PORT" == "$M_EP" && "$REQUESTED_IP" == "$M_IP" ]]; then
+      error "Elasticsearch port $REQUESTED_ES_PORT on $REQUESTED_IP is already in use by running container '$M_CONT'"
+      if [[ $NON_INTERACTIVE -eq 1 ]]; then exit 1; fi
+      read_config "Enter a different Elasticsearch Port" REQUESTED_ES_PORT $(($REQUESTED_ES_PORT + 1))
+    fi
+    
+    # Database check
+    M_RAW_JDBC=$(grep "^jdbc.default.url=" "$d/files/portal-ext.properties" 2>/dev/null | cut -d'=' -f2-)
+    M_JDBC_NORM=$(normalize_jdbc "$M_RAW_JDBC")
+    
+    if [[ -n "$CURR_JDBC_NORM" && -n "$M_JDBC_NORM" && "$CURR_JDBC_NORM" == "$M_JDBC_NORM" ]]; then
+      error "Database collision! This project uses the same database as running container '$M_CONT':"
+      IFS='|' read -r drv host dbp dbn <<< "$CURR_JDBC_NORM"
+      echo -e " ${White}Database: $dbn on $host:$dbp ($drv)${Color_Off}"
+      if [[ $NON_INTERACTIVE -eq 1 ]]; then exit 1; fi
+      read_config "Continue anyway?" CONT_DB N
+      if [[ "${CONT_DB:u}" != "Y" ]]; then exit 1; fi
+    fi
+  fi
+done
+
+LOCAL_PORT=$REQUESTED_PORT
+HOST_NAME=$REQUESTED_HOSTNAME
+ES_PORT=$REQUESTED_ES_PORT
+RESOLVED_IP=$REQUESTED_IP
+
+if [[ "$HOST_NAME" != "localhost" ]]; then
+  info "Verifying resolution for '$HOST_NAME'..."
+  if [[ "$RESOLVED_IP" != 127.* && "$RESOLVED_IP" != "::1" && "$RESOLVED_IP" != "0:0:0:0:0:0:0:1" ]]; then
+    error "Hostname '$HOST_NAME' resolves to $RESOLVED_IP, which is not a local loopback address."
+    echo -e "\n${BRed}IMPORTANT:${Color_Off} You must map '$HOST_NAME' to a loopback address (e.g. 127.0.0.1) in your OS hosts file."
+    echo -e "Edit ${Cyan}/etc/hosts${Color_Off} (macOS/Linux) or ${Cyan}C:\\Windows\\System32\\drivers\\etc\\hosts${Color_Off} (Windows)."
+    echo -e "Add the following line:\n${Green}127.0.0.1  $HOST_NAME${Color_Off}"
+    echo -e "(Alternatively, use any IP in the 127.0.0.0/8 range, like 127.0.0.74)\n"
+    
+    if [[ $NON_INTERACTIVE -eq 1 ]]; then exit 1; fi
+    read_config "Continue anyway?" CONT_HOST N
+    if [[ "${CONT_HOST:u}" != "Y" ]]; then exit 1; fi
+  else
+    # Check if IP is bindable (important for macOS)
+    if ! python3 -c "import socket; s=socket.socket(socket.AF_INET, socket.SOCK_STREAM); s.bind(('$RESOLVED_IP', 0)); s.close()" 2>/dev/null; then
+      error "IP address $RESOLVED_IP is not available for binding on this host."
+      print_macos_alias_advice "$RESOLVED_IP"
+      
+      if [[ $NON_INTERACTIVE -eq 1 ]]; then exit 1; fi
+      read_config "Continue anyway?" CONT_BIND N
+      if [[ "${CONT_BIND:u}" != "Y" ]]; then exit 1; fi
+    else
+      info "Resolved '$HOST_NAME' to loopback address $RESOLVED_IP (and verified it is bindable)"
+    fi
+  fi
 fi
 
 # Resolve Tag
@@ -299,7 +439,7 @@ fi
 # Ensure volumes and metadata folder
 if [[ ! -d "$LIFERAY_ROOT" ]]; then
   info_custom "${Yellow}ℹ Creating ${BYellow}volume ${Yellow}folders"
-  mkdir -p "$LIFERAY_ROOT/deploy" && cp ./7.4-common/*activationkeys.xml "$LIFERAY_ROOT/deploy"/ 2>/dev/null
+  mkdir -p "$LIFERAY_ROOT/deploy" && cp ./common/*activationkeys.xml "$LIFERAY_ROOT/deploy"/ 2>/dev/null
   mkdir -p "$LIFERAY_ROOT/data"
   mkdir -p "$LIFERAY_ROOT/osgi/client-extensions"
   mkdir -p "$LIFERAY_ROOT/osgi/state"
@@ -307,7 +447,7 @@ if [[ ! -d "$LIFERAY_ROOT" ]]; then
   mkdir -p "$LIFERAY_ROOT/files"
   mkdir -p "$LIFERAY_ROOT/scripts"
   mkdir -p "$LIFERAY_ROOT/backups"
-  cp ./7.4-common/*.properties "$LIFERAY_ROOT/files"/ 2>/dev/null
+  cp ./common/*.properties "$LIFERAY_ROOT/files"/ 2>/dev/null
 fi
 
 DEPLOY_VOLUME=$LIFERAY_ROOT/deploy
@@ -380,16 +520,41 @@ if [ $? -eq 1 ]; then
     if [[ "$USE_HOST_NETWORK" == "False" && $NON_INTERACTIVE -eq 0 ]]; then read_config "Use host network" UNET N; if [[ "${UNET:u}" == "Y" ]]; then USE_HOST_NETWORK=True; fi; fi
   fi
 
-  # Port
-  LOCAL_PORT=${PORT_ARG:-${META_PORT:-8080}}
-  if [[ "$USE_HOST_NETWORK" != "True" && $NON_INTERACTIVE -eq 0 && -z "$PORT_ARG" && -z "$META_PORT" ]]; then read_config "Local Port" LOCAL_PORT 8080; fi
+  # Virtual Hostname
+  if [[ "$HOST_NAME" == "localhost" && $NON_INTERACTIVE -eq 0 && -z "$HOST_NAME_ARG" && -z "$META_HOSTNAME" ]]; then read_config "Virtual Hostname (e.g. liferay.local)" HOST_NAME "localhost"; fi
+
+  # Elasticsearch Port
+  if [[ "$ES_PORT" == "9200" && $NON_INTERACTIVE -eq 0 && -z "$ES_PORT_ARG" && -z "$META_ES_PORT" ]]; then read_config "Elasticsearch Sidecar Port" ES_PORT "9200"; fi
 
   # Zip64
   DZ64=False
   if [[ -n "$DISABLE_ZIP64_FLAG_EXPL" ]]; then DZ64=True; fi
 
-  if [[ "$DZ64" == "True" ]]; then DISABLE_ZIP64_FLAG="-e LIFERAY_JVM_OPTS=-Djdk.util.zip.disableZip64ExtraFieldValidation=true"; fi
-  if [[ "$USE_HOST_NETWORK" == "True" ]]; then NETWORK_ARGS="--network=host"; else NETWORK_ARGS="-p ${LOCAL_PORT}:8080"; fi
+  JVM_OPTS=""
+  if [[ "$DZ64" == "True" ]]; then JVM_OPTS="-Djdk.util.zip.disableZip64ExtraFieldValidation=true"; fi
+  
+  # Configuration injections
+  if [[ "$HOST_NAME" != "localhost" ]]; then
+    SAFE_HOST=$(echo "$HOST_NAME" | sed 's/[\.-]/_/g')
+    COOKIE_ID="LFR_SESSION_ID_${SAFE_HOST}"
+    JVM_OPTS="${JVM_OPTS} -Dorg.apache.catalina.SESSION_COOKIE_NAME=${COOKIE_ID}"
+    
+    { echo -e "\nsession.cookie.domain=${HOST_NAME}"; echo -e "session.cookie.use.full.hostname=true"; echo -e "virtual.hosts.valid.hosts=localhost,127.0.0.1,[::1],${HOST_NAME},${RESOLVED_IP}"; } >> "${FILES_VOLUME}"/portal-ext.properties
+  fi
+
+  if [[ "$ES_PORT" != "9200" ]]; then
+    ES_TRANSPORT=$(($ES_PORT + 100))
+    { echo -e "\nmodule.framework.properties.com.liferay.portal.search.elasticsearch7.configuration.ElasticsearchConfiguration.sidecarHttpPort=${ES_PORT}"; echo -e "module.framework.properties.com.liferay.portal.search.elasticsearch7.configuration.ElasticsearchConfiguration.transportTcpPort=${ES_TRANSPORT}"; } >> "${FILES_VOLUME}"/portal-ext.properties
+  fi
+
+  if [[ -n "$JVM_OPTS" ]]; then DISABLE_ZIP64_FLAG="-e LIFERAY_JVM_OPTS=${JVM_OPTS}"; fi
+  
+  if [[ "$USE_HOST_NETWORK" == "True" ]]; then 
+    NETWORK_ARGS="--network=host"
+  else 
+    # Use RESOLVED_IP for port binding to allow same-port reuse on different loopback IPs
+    NETWORK_ARGS="-p ${RESOLVED_IP}:${LOCAL_PORT}:8080 -p ${RESOLVED_IP}:${ES_PORT}:9200"
+  fi
 
   LIFRAY_IMAGE_TAG=$IMAGE_NAME:$LIFERAY_TAG
   info_custom "${Yellow}ℹ Pulling ${BYellow}$LIFRAY_IMAGE_TAG"
@@ -402,10 +567,45 @@ if [ $? -eq 1 ]; then
   write_meta "$LIFERAY_ROOT/$PROJECT_META_FILE" "db_type" "$LIFERAY_DATABASE"
   write_meta "$LIFERAY_ROOT/$PROJECT_META_FILE" "container_name" "$CONTAINER_NAME"
   write_meta "$LIFERAY_ROOT/$PROJECT_META_FILE" "host_network" "$USE_HOST_NETWORK"
+  write_meta "$LIFERAY_ROOT/$PROJECT_META_FILE" "host_name" "$HOST_NAME"
+  write_meta "$LIFERAY_ROOT/$PROJECT_META_FILE" "es_port" "$ES_PORT"
   write_meta "$LIFERAY_ROOT/$PROJECT_META_FILE" "last_run" "$(date -Iseconds)"
 
-  docker start -i -a "${CONTAINER_NAME}"
-  if [[ "${REMOVE_CONTAINER:u}" == "Y" ]]; then info "Deleting $CONTAINER_NAME"; docker rm --force "$CONTAINER_NAME" >/dev/null 2>&1; else info "Stopping $CONTAINER_NAME"; docker stop "$CONTAINER_NAME" >/dev/null 2>&1; fi
+  if [[ $FOLLOW_FLAG -eq 1 ]]; then
+    DOCKER_OUT=$(docker start -i -a "${CONTAINER_NAME}" 2>&1)
+    D_EXIT=$?
+    echo "$DOCKER_OUT"
+    if [ $D_EXIT -ne 0 ]; then
+      if echo "$DOCKER_OUT" | grep -q "can't assign requested address"; then
+        error "Failed to start container: Port binding error."
+        print_macos_alias_advice "$RESOLVED_IP"
+      fi
+      exit $D_EXIT
+    fi
+  else
+    info "Starting ${CONTAINER_NAME} in background..."
+    DOCKER_OUT=$(docker start "${CONTAINER_NAME}" 2>&1)
+    D_EXIT=$?
+    if [ $D_EXIT -ne 0 ]; then
+      echo "$DOCKER_OUT"
+      if echo "$DOCKER_OUT" | grep -q "can't assign requested address"; then
+        error "Failed to start container: Port binding error."
+        print_macos_alias_advice "$RESOLVED_IP"
+      fi
+      exit $D_EXIT
+    fi
+    success "Container ${CONTAINER_NAME} started. Use './liferay-docker.sh run --follow' to see logs."
+  fi
+
+  if [[ "${REMOVE_CONTAINER:u}" == "Y" ]]; then
+    if [[ $FOLLOW_FLAG -eq 1 ]]; then
+      info "Deleting $CONTAINER_NAME"; docker rm --force "$CONTAINER_NAME" >/dev/null 2>&1;
+    fi
+  else
+    if [[ $FOLLOW_FLAG -eq 1 ]]; then
+      info "Stopping $CONTAINER_NAME"; docker stop "$CONTAINER_NAME" >/dev/null 2>&1;
+    fi
+  fi
 else
   info_custom "${BYELLOW}=== Resuming $CONTAINER_NAME ==="
   if [[ -n "$REMOVE_AFTER_FLAG" ]]; then REMOVE_CONTAINER=Y; elif [[ -n "$KEEP_CONTAINER_FLAG" ]]; then REMOVE_CONTAINER=N; else read_config "Remove container afterwards" REMOVE_CONTAINER N; fi
@@ -415,6 +615,46 @@ else
   # Update last_run
   write_meta "$LIFERAY_ROOT/$PROJECT_META_FILE" "last_run" "$(date -Iseconds)"
 
-  docker start -i -a "${CONTAINER_NAME}"
-  if [[ "${REMOVE_CONTAINER:u}" == "Y" ]]; then info "Deleting $CONTAINER_NAME"; docker rm --force "$CONTAINER_NAME" >/dev/null 2>&1; else info "Stopping $CONTAINER_NAME"; docker stop "$CONTAINER_NAME" >/dev/null 2>&1; fi
+  if [[ $FOLLOW_FLAG -eq 1 ]]; then
+    DOCKER_OUT=$(docker start -i -a "${CONTAINER_NAME}" 2>&1)
+    D_EXIT=$?
+    echo "$DOCKER_OUT"
+    if [ $D_EXIT -ne 0 ]; then
+      if echo "$DOCKER_OUT" | grep -q "can't assign requested address"; then
+        error "Failed to start container: Port binding error."
+        # Need to get resolved IP from meta or hostname
+        M_HOST=$(read_meta "$LIFERAY_ROOT/$PROJECT_META_FILE" "host_name")
+        M_IP=$(python3 -c "import socket; print(socket.gethostbyname('${M_HOST:-localhost}'))" 2>/dev/null)
+        [[ -z "$M_IP" ]] && M_IP="127.0.0.1"
+        print_macos_alias_advice "$M_IP"
+      fi
+      exit $D_EXIT
+    fi
+  else
+    info "Starting ${CONTAINER_NAME} in background..."
+    DOCKER_OUT=$(docker start "${CONTAINER_NAME}" 2>&1)
+    D_EXIT=$?
+    if [ $D_EXIT -ne 0 ]; then
+      echo "$DOCKER_OUT"
+      if echo "$DOCKER_OUT" | grep -q "can't assign requested address"; then
+        error "Failed to start container: Port binding error."
+        M_HOST=$(read_meta "$LIFERAY_ROOT/$PROJECT_META_FILE" "host_name")
+        M_IP=$(python3 -c "import socket; print(socket.gethostbyname('${M_HOST:-localhost}'))" 2>/dev/null)
+        [[ -z "$M_IP" ]] && M_IP="127.0.0.1"
+        print_macos_alias_advice "$M_IP"
+      fi
+      exit $D_EXIT
+    fi
+    success "Container ${CONTAINER_NAME} started. Use './liferay-docker.sh run --follow' to see logs."
+  fi
+
+  if [[ "${REMOVE_CONTAINER:u}" == "Y" ]]; then
+    if [[ $FOLLOW_FLAG -eq 1 ]]; then
+      info "Deleting $CONTAINER_NAME"; docker rm --force "$CONTAINER_NAME" >/dev/null 2>&1;
+    fi
+  else
+    if [[ $FOLLOW_FLAG -eq 1 ]]; then
+      info "Stopping $CONTAINER_NAME"; docker stop "$CONTAINER_NAME" >/dev/null 2>&1;
+    fi
+  fi
 fi
