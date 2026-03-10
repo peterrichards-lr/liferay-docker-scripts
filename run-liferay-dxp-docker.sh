@@ -39,7 +39,6 @@ RECREATE_DB_FLAG=""
 HOST_NETWORK_FLAG=""
 NO_HOST_NETWORK_FLAG=""
 DISABLE_ZIP64_FLAG_EXPL=""
-ENABLE_ZIP64_FLAG_EXPL=""
 PORT_ARG=""
 REMOVE_AFTER_FLAG=""
 KEEP_CONTAINER_FLAG=""
@@ -146,7 +145,6 @@ while [[ $# -gt 0 ]]; do
     --host-network) HOST_NETWORK_FLAG=1 ;;
     --no-host-network) NO_HOST_NETWORK_FLAG=1 ;;
     --disable-zip64) DISABLE_ZIP64_FLAG_EXPL=1 ;;
-    --enable-zip64) ENABLE_ZIP64_FLAG_EXPL=1 ;;
     -p|--port) shift; [[ -z "$1" || "$1" != <-> ]] && _die "--port requires a number"; PORT_ARG="$1" ;;
     --remove-after) REMOVE_AFTER_FLAG=1 ;;
     --keep-container) KEEP_CONTAINER_FLAG=1 ;;
@@ -172,7 +170,7 @@ while [[ $# -gt 0 ]]; do
       echo "Runtime behavior:";
       echo "  -p, --port <8080>             Local HTTP port mapping. Default: 8080";
       echo "      --host-network|--no-host-network  Use or avoid host networking. Default: disabled";
-      echo "      --disable-zip64|--enable-zip64    Toggle Zip64 extra field validation. Default: disabled";
+      echo "      --disable-zip64           Disable Zip64 extra field validation. Default: enabled";
       echo "      --remove-after|--keep-container   Remove container after run or keep it. Default: keep when created, stop when kept";
       echo "      --delete-state             When container already exists, delete osgi/state before starting";
       echo "      --non-interactive         Do not prompt; apply defaults and provided flags";
@@ -236,7 +234,6 @@ if [[ -n "$LIFERAY_ROOT" && -d "$LIFERAY_ROOT" ]]; then
   META_DB=$(read_meta "$LIFERAY_ROOT/$PROJECT_META_FILE" "db_type")
   META_CONTAINER=$(read_meta "$LIFERAY_ROOT/$PROJECT_META_FILE" "container_name")
   META_HOSTNET=$(read_meta "$LIFERAY_ROOT/$PROJECT_META_FILE" "host_network")
-  META_ZIP64=$(read_meta "$LIFERAY_ROOT/$PROJECT_META_FILE" "disable_zip64")
 fi
 
 # Resolve Tag
@@ -388,10 +385,8 @@ if [ $? -eq 1 ]; then
   if [[ "$USE_HOST_NETWORK" != "True" && $NON_INTERACTIVE -eq 0 && -z "$PORT_ARG" && -z "$META_PORT" ]]; then read_config "Local Port" LOCAL_PORT 8080; fi
 
   # Zip64
-  if [[ -n "$DISABLE_ZIP64_FLAG_EXPL" ]]; then DZ64=True; elif [[ -n "$ENABLE_ZIP64_FLAG_EXPL" ]]; then DZ64=False; else 
-    DZ64=${META_ZIP64:-"False"}
-    if [[ "$DZ64" == "False" && $NON_INTERACTIVE -eq 0 ]]; then read_config "Disable ZIP64 Extra Field Validation" UZ64 N; if [[ "${UZ64:u}" == "Y" ]]; then DZ64=True; fi; fi
-  fi
+  DZ64=False
+  if [[ -n "$DISABLE_ZIP64_FLAG_EXPL" ]]; then DZ64=True; fi
 
   if [[ "$DZ64" == "True" ]]; then DISABLE_ZIP64_FLAG="-e LIFERAY_JVM_OPTS=-Djdk.util.zip.disableZip64ExtraFieldValidation=true"; fi
   if [[ "$USE_HOST_NETWORK" == "True" ]]; then NETWORK_ARGS="--network=host"; else NETWORK_ARGS="-p ${LOCAL_PORT}:8080"; fi
@@ -407,7 +402,6 @@ if [ $? -eq 1 ]; then
   write_meta "$LIFERAY_ROOT/$PROJECT_META_FILE" "db_type" "$LIFERAY_DATABASE"
   write_meta "$LIFERAY_ROOT/$PROJECT_META_FILE" "container_name" "$CONTAINER_NAME"
   write_meta "$LIFERAY_ROOT/$PROJECT_META_FILE" "host_network" "$USE_HOST_NETWORK"
-  write_meta "$LIFERAY_ROOT/$PROJECT_META_FILE" "disable_zip64" "$DZ64"
   write_meta "$LIFERAY_ROOT/$PROJECT_META_FILE" "last_run" "$(date -Iseconds)"
 
   docker start -i -a "${CONTAINER_NAME}"

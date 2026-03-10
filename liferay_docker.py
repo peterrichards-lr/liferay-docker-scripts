@@ -327,10 +327,7 @@ class LiferayManager:
             if host_net_meta is not None: use_host_net = (host_net_meta == "True")
 
         port = self.args.port or project_meta.get("port")
-        disable_zip64 = getattr(self.args, 'disable_zip64', None)
-        if disable_zip64 is None:
-            zip64_meta = project_meta.get("disable_zip64")
-            if zip64_meta is not None: disable_zip64 = (zip64_meta == "True")
+        disable_zip64 = getattr(self.args, 'disable_zip64', False)
 
         if not inspect or container_name not in inspect.split("\n"):
             UI.heading(f"Initializing {container_name}")
