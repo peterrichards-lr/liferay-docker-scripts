@@ -1,0 +1,16 @@
+<?xml version="1.0"?>
+
+<license>
+	<account-name>Liferay, Inc.</account-name>
+	<owner>Peter Richards</owner>
+	<description>Liferay, Inc. Developer Activation Keys</description>
+	<product-name>DXP Development</product-name>
+	<product-version>7.4</product-version>
+	<license-name>Digital Enterprise Development</license-name>
+	<license-type>developer</license-type>
+	<license-version>6</license-version>
+	<start-date>Monday, March 20, 2023 10:57:51 AM GMT</start-date>
+	<expiration-date>Wednesday, February 24, 2123 10:57:51 AM GMT</expiration-date>
+	<max-http-sessions>5</max-http-sessions>
+	<key>5ce8bfd34f178df281942cfced5f1d904b46b132cf37c7a8372c871022ae5f80091900df6d56892395bb6109840c614c96e5a08f2ba00b704964247330dbf6f1fc7fe982ab91954ebb9e177a5ff950b0be70f181ec12e4ecad479827d7bbc8384c41cc0353b642cdf962a0a791850356788e06cc95985836addd9274578e4e02f0e98f8d</key>
+</license>

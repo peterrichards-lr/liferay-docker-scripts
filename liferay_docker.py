@@ -9,14 +9,17 @@ import subprocess
 import tarfile
 import gzip
 import lzma
+import socket
 from datetime import datetime
 from pathlib import Path
 from urllib.request import urlopen, Request
 from urllib.error import URLError
 
 # --- Constants & Configuration ---
-IMAGE_NAME = "liferay/dxp"
-API_BASE = "https://hub.docker.com/v2/repositories/liferay/dxp/tags?page_size=200&ordering=name"
+IMAGE_NAME_DXP = "liferay/dxp"
+IMAGE_NAME_PORTAL = "liferay/portal"
+API_BASE_DXP = "https://hub.docker.com/v2/repositories/liferay/dxp/tags?page_size=200&ordering=name"
+API_BASE_PORTAL = "https://hub.docker.com/v2/repositories/liferay/portal/tags?page_size=200&ordering=name"
 META_VERSION = "2"
 MIN_META_VERSION = 2
 PROJECT_META_FILE = ".liferay-docker.meta"
@@ -83,9 +86,13 @@ def run_command(cmd, shell=False, capture_output=True, check=True, env=None):
             return None
         return result.stdout.strip() if result.stdout else ""
     except subprocess.CalledProcessError as e:
+        if e.returncode == 130:
+            raise KeyboardInterrupt()
         if check:
             raise e
         return None
+    except KeyboardInterrupt:
+        raise
 
 def get_json(url):
     try:
@@ -96,8 +103,8 @@ def get_json(url):
         UI.error(f"Failed to fetch data: {e}")
         return None
 
-def discover_latest_tag(release_type="any", year_filter=None, verbose=False):
-    url = API_BASE
+def discover_latest_tag(api_url, release_type="any", year_filter=None, verbose=False):
+    url = api_url
     if release_type == "lts": url += "&name=-lts"
     elif release_type == "u": url += "&name=-u"
 
@@ -138,11 +145,11 @@ class LiferayManager:
         self.non_interactive = getattr(args, 'non_interactive', False)
         
         # Ensure all 'run' command attributes are present to avoid AttributeError
-        # when forcing command='run' via top-level --list
+        # when forcing command='run' via top-level --select
         run_attrs = [
             'tag', 'root', 'container', 'follow', 'release_type', 'db', 
             'jdbc_username', 'jdbc_password', 'recreate_db', 'port', 
-            'host_network', 'disable_zip64', 'delete_state', 'remove_after'
+            'host_network', 'host_name', 'es_port', 'disable_zip64', 'delete_state', 'remove_after', 'portal'
         ]
         for attr in run_attrs:
             if not hasattr(self.args, attr):
@@ -163,10 +170,11 @@ class LiferayManager:
     def find_dxp_roots(self, search_dir=None):
         search_dir = Path(search_dir or Path.cwd())
         roots = []
+        if not search_dir.exists(): return roots
         for item in search_dir.iterdir():
             if item.is_dir() and not item.name.startswith('.'):
-                # Heuristic: must have files/ or deploy/
-                if (item / "files").exists() or (item / "deploy").exists():
+                # Heuristic: must have files/ or deploy/ or .meta
+                if (item / "files").exists() or (item / "deploy").exists() or (item / PROJECT_META_FILE).exists():
                     meta = self.read_meta(item / PROJECT_META_FILE)
                     version = meta.get("tag")
                     if not version:
@@ -259,11 +267,90 @@ class LiferayManager:
         except Exception:
             return False
 
+    def get_resolved_ip(self, host_name):
+        if not host_name or host_name == "localhost":
+            return "127.0.0.1"
+        try:
+            return socket.gethostbyname(host_name)
+        except socket.gaierror:
+            return None
+
+    def is_bindable(self, ip):
+        """Checks if the IP address is actually bound to an interface and ready for listening."""
+        try:
+            # Try to create a dummy socket and bind to it on an ephemeral port
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.bind((ip, 0))
+            return True
+        except Exception as e:
+            if self.verbose:
+                UI.info(f"Bind check for {ip} failed: {e}")
+            return False
+
+    def check_hostname(self, host_name):
+        if not host_name or host_name == "localhost":
+            return True
+        
+        UI.info(f"Verifying resolution for '{host_name}'...")
+        ip = self.get_resolved_ip(host_name)
+        
+        if not ip:
+            UI.error(f"Hostname '{host_name}' could not be resolved.")
+            print(f"\n{UI.BRED}IMPORTANT:{UI.COLOR_OFF} You must map '{host_name}' to a loopback address (e.g. 127.0.0.1) in your OS hosts file.")
+            print(f"Edit {UI.CYAN}/etc/hosts{UI.COLOR_OFF} (macOS/Linux) or {UI.CYAN}C:\\Windows\\System32\\drivers\\etc\\hosts{UI.COLOR_OFF} (Windows).")
+            print(f"Add the following line:\n{UI.GREEN}127.0.0.1  {host_name}{UI.COLOR_OFF}")
+            if self.non_interactive: sys.exit(1)
+            return UI.ask("Continue anyway?", "N").upper() == "Y"
+
+        if not (ip.startswith("127.") or ip in ["::1", "0:0:0:0:0:0:0:1"]):
+            UI.error(f"Hostname '{host_name}' resolves to {ip}, which is not a local loopback address.")
+            if self.non_interactive: sys.exit(1)
+            return UI.ask("Continue anyway?", "N").upper() == "Y"
+
+        UI.success(f"Resolved '{host_name}' to loopback address {ip}")
+        
+        # Verify if IP is actually bindable (especially important for macOS)
+        if not self.is_bindable(ip):
+            UI.error(f"IP address {ip} is not available for binding on this host.")
+            self.print_macos_alias_advice(ip)
+            
+            if self.non_interactive:
+                sys.exit(1)
+            
+            if not UI.ask("Continue anyway?", "N").upper() == "Y":
+                sys.exit(1)
+
+        return True
+
+    def print_macos_alias_advice(self, ip):
+        if sys.platform == "darwin":
+            print(f"\n{UI.BRED}OSX DETECTED:{UI.COLOR_OFF} You must alias this IP to your loopback interface.")
+            print(f"Run the following command in your terminal:")
+            print(f"{UI.CYAN}sudo ifconfig lo0 alias {ip} up{UI.COLOR_OFF}\n")
+        else:
+            print(f"\nEnsure your network interface is configured to handle {ip}.")
+
+    def normalize_jdbc_url(self, url):
+        """Extracts host, port, and database name for comparison."""
+        if not url: return None
+        # Pattern for standard PostgreSQL/MySQL JDBC URLs
+        pattern = r'^jdbc:(postgresql|mysql|mariadb)://([^:/]+)(?::(\d+))?/([^/?]+)'
+        match = re.match(pattern, url)
+        if match:
+            driver, host, port, db_name = match.groups()
+            # Normalize host
+            if host in ['localhost', 'host.docker.internal']: host = '127.0.0.1'
+            # Default ports
+            if not port:
+                port = '5432' if driver == 'postgresql' else '3306'
+            return (driver, host, port, db_name)
+        return url
+
     def cmd_run(self):
         if not self.check_docker():
             UI.die("Docker is not running or not accessible. Please start Docker and try again.")
 
-        if getattr(self.args, 'list', False):
+        if getattr(self.args, 'select', False):
             roots = self.find_dxp_roots()
             UI.heading("Available DXP Folders")
             for i, root in enumerate(roots):
@@ -290,7 +377,71 @@ class LiferayManager:
         if root_path and Path(root_path).exists():
             project_meta = self.read_meta(Path(root_path) / PROJECT_META_FILE)
 
+        # Early Conflict & Hostname Check
+        port = self.args.port or project_meta.get("port")
+        host_name = self.args.host_name or project_meta.get("host_name")
+        es_port = self.args.es_port or project_meta.get("es_port")
+        container_name = self.args.container or project_meta.get("container_name") or (Path(root_path).name.replace(".", "-") if root_path else None)
+
+        if host_name and not self.check_hostname(host_name):
+            sys.exit(1)
+
+        if not self.non_interactive or self.args.port or self.args.host_name or self.args.es_port:
+            search_dir = Path(root_path).parent if root_path else Path.cwd()
+            other_projects = self.find_dxp_roots(search_dir)
+            
+            curr_jdbc = {}
+            if root_path:
+                curr_jdbc = self.get_jdbc_params(Path(root_path) / "files")
+            
+            curr_normalized = self.normalize_jdbc_url(curr_jdbc.get("jdbc.default.url"))
+            
+            for proj in other_projects:
+                if root_path and proj["path"].resolve() == Path(root_path).resolve():
+                    continue
+                
+                meta = self.read_meta(proj["path"] / PROJECT_META_FILE)
+                # Check if project is likely running (container exists)
+                check_cmd = ["docker", "ps", "--filter", f"name=^{meta.get('container_name')}$", "--format", "{{.Names}}"]
+                if run_command(check_cmd, check=False):
+                    m_ip = self.get_resolved_ip(meta.get("host_name")) or "127.0.0.1"
+                    r_ip = self.get_resolved_ip(host_name) or "127.0.0.1"
+                    
+                    if port and str(port) == meta.get("port") and m_ip == r_ip:
+                        UI.error(f"Port {port} on {r_ip} is already in use by running container '{meta.get('container_name')}'")
+                        if self.non_interactive: sys.exit(1)
+                        port = int(UI.ask("Enter a different Local Port", int(port) + 1))
+                    
+                    if host_name and host_name != "localhost" and host_name == meta.get("host_name"):
+                        UI.error(f"Hostname '{host_name}' is already in use by running container '{meta.get('container_name')}'")
+                        if self.non_interactive: sys.exit(1)
+                        host_name = UI.ask("Enter a different Hostname", f"alt-{host_name}")
+
+                    if es_port and str(es_port) == meta.get("es_port") and m_ip == r_ip:
+                        UI.error(f"Elasticsearch port {es_port} on {r_ip} is already in use by running container '{meta.get('container_name')}'")
+                        if self.non_interactive: sys.exit(1)
+                        es_port = int(UI.ask("Enter a different Elasticsearch Port", int(es_port) + 1))
+                    
+                    # Database check
+                    proj_jdbc = self.get_jdbc_params(proj["path"] / "files")
+                    proj_normalized = self.normalize_jdbc_url(proj_jdbc.get("jdbc.default.url"))
+                    
+                    if curr_normalized and proj_normalized and curr_normalized == proj_normalized:
+                        UI.error(f"Database collision! This project uses the same database as running container '{meta.get('container_name')}':")
+                        if isinstance(curr_normalized, tuple):
+                            driver, host, db_port, db_name = curr_normalized
+                            print(f" {UI.WHITE}Database: {db_name} on {host}:{db_port} ({driver}){UI.COLOR_OFF}")
+                        else:
+                            print(f" {UI.WHITE}{curr_normalized}{UI.COLOR_OFF}")
+                        
+                        if self.non_interactive: sys.exit(1)
+                        if UI.ask("Continue anyway?", "N").upper() != "Y": sys.exit(1)
+
         tag = self.args.tag or project_meta.get("tag")
+        use_portal = self.args.portal or (project_meta.get("image_type") == "portal")
+        image_name = IMAGE_NAME_PORTAL if use_portal else IMAGE_NAME_DXP
+        api_base = API_BASE_PORTAL if use_portal else API_BASE_DXP
+
         if not tag:
             if root_path and re.match(TAG_PATTERN, Path(root_path).name):
                 tag = Path(root_path).name
@@ -303,9 +454,9 @@ class LiferayManager:
                 else:
                     release_type = ans
                     year = datetime.now().strftime("%Y")
-                    tag = discover_latest_tag(release_type, year, self.verbose)
+                    tag = discover_latest_tag(api_base, release_type, year, self.verbose)
                     if not tag:
-                        tag = discover_latest_tag(release_type, None, self.verbose)
+                        tag = discover_latest_tag(api_base, release_type, None, self.verbose)
                     
                     if not self.non_interactive:
                         tag = UI.ask("Enter Liferay Docker Tag", tag)
@@ -316,7 +467,8 @@ class LiferayManager:
         root_path = self.args.root or (UI.ask("Liferay Root", root_default) if not self.non_interactive else root_default)
         paths = self.setup_paths(root_path)
 
-        container_name = self.args.container or project_meta.get("container_name") or Path(root_path).name.replace(".", "-")
+        if not container_name:
+            container_name = self.args.container or project_meta.get("container_name") or Path(root_path).name.replace(".", "-")
         
         inspect = run_command(["docker", "ps", "-a", "--filter", f"name=^{container_name}$", "--format", "{{.Names}}"], check=False)
         
@@ -326,7 +478,6 @@ class LiferayManager:
             host_net_meta = project_meta.get("host_network")
             if host_net_meta is not None: use_host_net = (host_net_meta == "True")
 
-        port = self.args.port or project_meta.get("port")
         disable_zip64 = getattr(self.args, 'disable_zip64', False)
 
         if not inspect or container_name not in inspect.split("\n"):
@@ -335,16 +486,16 @@ class LiferayManager:
             for p in paths.values():
                 p.mkdir(parents=True, exist_ok=True)
             
-            common_dir = Path("7.4-common")
+            common_dir = Path("common")
             if common_dir.exists():
                 for f in common_dir.glob("*activationkeys.xml"):
-                    shutil.copy(f, paths["deploy"])
+                    if not use_portal: shutil.copy(f, paths["deploy"])
                 for f in common_dir.glob("*.properties"):
                     shutil.copy(f, paths["files"])
 
             rm_container = getattr(self.args, 'remove_after', False)
             if not rm_container and not self.non_interactive:
-                rm_container = UI.ask("Remove container afterwards?", "Y") == "Y"
+                rm_container = UI.ask("Remove container afterwards?", "N") == "Y"
             rm_arg = ["--rm"] if rm_container else []
 
             if not db_kind and not self.non_interactive:
@@ -401,28 +552,66 @@ class LiferayManager:
                 with open(portal_ext, "a") as f:
                     f.write("\n" + "\n".join(filter(None, jdbc_lines)) + "\n")
 
+            net_args = []
             if use_host_net is None and not self.non_interactive:
                 use_host_net = UI.ask("Use host network?", "N") == "Y"
             elif use_host_net is None:
                 use_host_net = False
 
-            net_args = []
+            resolved_ip = self.get_resolved_ip(host_name) or "127.0.0.1"
+
             if use_host_net:
                 net_args = ["--network", "host"]
             else:
                 port = port or (int(UI.ask("Local Port", "8080")) if not self.non_interactive else 8080)
-                net_args = ["-p", f"{port}:8080"]
+                net_args = ["-p", f"{resolved_ip}:{port}:8080"]
 
-            if disable_zip64 is None and not self.non_interactive:
-                disable_zip64 = UI.ask("Disable ZIP64 Extra Field Validation?", "N") == "Y"
-            elif disable_zip64 is None:
-                disable_zip64 = False
-            
+            if not host_name and not self.non_interactive:
+                host_name = UI.ask("Virtual Hostname (e.g. liferay.local)", "localhost")
+            elif not host_name:
+                host_name = "localhost"
+
+            if not es_port and not self.non_interactive:
+                es_port = UI.ask("Elasticsearch Sidecar Port", "9200")
+            elif not es_port:
+                es_port = "9200"
+
+            # Always expose ES port to the resolved IP for developer convenience
+            if not use_host_net:
+                net_args += ["-p", f"{resolved_ip}:{es_port}:9200"]
+
             env_args = []
             if disable_zip64:
                 env_args += ["-e", "LIFERAY_JVM_OPTS=-Djdk.util.zip.disableZip64ExtraFieldValidation=true"]
+            
+            portal_ext = paths["files"] / "portal-ext.properties"
+            with open(portal_ext, "a") as f:
+                if host_name and host_name != "localhost":
+                    safe_host = host_name.replace(".", "_").replace("-", "_")
+                    cookie_name = f"LFR_SESSION_ID_{safe_host}"
+                    jvm_opts = f"-Dorg.apache.catalina.SESSION_COOKIE_NAME={cookie_name}"
+                    
+                    # Append to existing opts if any
+                    found = False
+                    for i, arg in enumerate(env_args):
+                        if "LIFERAY_JVM_OPTS=" in arg:
+                            env_args[i] = arg.replace("LIFERAY_JVM_OPTS=", f"LIFERAY_JVM_OPTS={jvm_opts} ")
+                            found = True
+                            break
+                    if not found:
+                        env_args += ["-e", f"LIFERAY_JVM_OPTS={jvm_opts}"]
+                    
+                    f.write(f"\nsession.cookie.domain={host_name}\n")
+                    f.write("session.cookie.use.full.hostname=true\n")
+                    # Add virtual host to valid list (LPS-184385)
+                    f.write(f"virtual.hosts.valid.hosts=localhost,127.0.0.1,[::1],{host_name},{resolved_ip}\n")
 
-            image_tag = f"{IMAGE_NAME}:{tag}"
+                if es_port and str(es_port) != "9200":
+                    es_transport = str(int(es_port) + 100)
+                    f.write(f"\nmodule.framework.properties.com.liferay.portal.search.elasticsearch7.configuration.ElasticsearchConfiguration.sidecarHttpPort={es_port}\n")
+                    f.write(f"module.framework.properties.com.liferay.portal.search.elasticsearch7.configuration.ElasticsearchConfiguration.transportTcpPort={es_transport}\n")
+
+            image_tag = f"{image_name}:{tag}"
             UI.info(f"Pulling {image_tag}...")
             run_command(["docker", "pull", image_tag], capture_output=False)
             
@@ -458,33 +647,54 @@ class LiferayManager:
 
         project_meta.update({
             "tag": tag,
+            "image_type": "portal" if use_portal else "dxp",
             "container_name": container_name,
             "db_type": db_kind or "hypersonic",
             "port": str(port) if port else "8080",
             "host_network": str(use_host_net),
+            "host_name": host_name or "localhost",
+            "es_port": str(es_port) if es_port else "9200",
             "disable_zip64": str(disable_zip64),
             "last_run": datetime.now().isoformat()
         })
         self.write_meta(paths["root"] / PROJECT_META_FILE, project_meta)
 
-        if getattr(self.args, 'follow', False):
-            subprocess.Popen(["docker", "start", container_name])
-            UI.info("Following logs (Ctrl+C to stop container)...")
-            try:
-                run_command(["docker", "logs", "-f", container_name], capture_output=False)
-            except KeyboardInterrupt:
-                pass
-        else:
-            run_command(["docker", "start", "-i", "-a", container_name], capture_output=False)
+        resolved_ip = self.get_resolved_ip(host_name) or "127.0.0.1"
+
+        try:
+            if getattr(self.args, 'follow', False):
+                UI.info(f"Starting {container_name} and following logs...")
+                # Start detached first, then attach to logs
+                run_command(["docker", "start", container_name], capture_output=False)
+                try:
+                    run_command(["docker", "logs", "-f", container_name], capture_output=False)
+                except KeyboardInterrupt:
+                    # Clean stop if follow is interrupted
+                    UI.info(f"Stopping {container_name}...")
+                    run_command(["docker", "stop", container_name], check=False)
+            else:
+                UI.info(f"Starting {container_name} in background...")
+                run_command(["docker", "start", container_name], capture_output=False)
+                UI.success(f"Container {container_name} started. Use './liferay-docker.sh run --follow' to see logs.")
+        except (subprocess.CalledProcessError, KeyboardInterrupt) as e:
+            if isinstance(e, subprocess.CalledProcessError):
+                if "can't assign requested address" in str(e.stderr or "") or "bind: can't assign requested address" in (e.stdout or ""):
+                    UI.error(f"Failed to start container: Port binding error.")
+                    self.print_macos_alias_advice(resolved_ip)
+                    sys.exit(1)
+                if e.returncode == 130:
+                    # Cleanly handled by main loop
+                    raise KeyboardInterrupt()
+                raise e
+            else:
+                # Top-level handler in main() will catch this
+                raise
         
         if rm_container:
             UI.info(f"Deleting {container_name}")
             run_command(["docker", "rm", "--force", container_name], check=False)
-        else:
-            UI.info(f"Stopping {container_name}")
-            run_command(["docker", "stop", container_name], check=False)
 
-    def cmd_list(self):
+    def cmd_snapshots(self):
         root_path = self.detect_root() or os.getcwd()
         paths = self.setup_paths(root_path)
         
@@ -653,7 +863,7 @@ class LiferayManager:
             choice = paths["backups"] / self.args.checkpoint
             if not choice.exists(): UI.die(f"Snapshot {self.args.checkpoint} not found.")
         else:
-            self.cmd_list()
+            self.cmd_snapshots()
             choice = backups[int(UI.ask("Select snapshot index", "1")) - 1]
 
         container_name = self.args.container or Path(root_path).name.replace(".", "-")
@@ -736,7 +946,7 @@ class LiferayManager:
                     dbname = url.split("/")[-1].split("?")[0]
                     host = self.args.my_host or "localhost"
                     port = self.args.my_port or "3306"
-                    UI.info(f"Restoring MySQL: {dbname}")
+                    UI.info(f"MySQL: {dbname}")
                     pw_arg = f"-p{pw}" if pw else ""
                     run_command(["mysql", "-h", host, "-P", port, "-u", user, pw_arg, "-e", f"DROP DATABASE IF EXISTS `{dbname}`; CREATE DATABASE `{dbname}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"])
                     with open(dump, "rb") as f_in:
@@ -759,16 +969,17 @@ class LiferayManager:
 # --- Main CLI ---
 def main():
     parser = argparse.ArgumentParser(description="Liferay DXP Docker Manager (Python)")
-    parser.add_argument("--list", action="store_true", help="List available DXP folders")
+    parser.add_argument("--select", action="store_true", help="Browse and select managed DXP folders")
     subparsers = parser.add_subparsers(dest="command", help="Command to run")
 
     # Run command
     run_parser = subparsers.add_parser("run", help="Run Liferay DXP container")
-    run_parser.add_argument("--list", action="store_true", help="List available DXP folders")
+    run_parser.add_argument("--select", action="store_true", help="Browse and select managed DXP folders")
     run_parser.add_argument("-t", "--tag", help="Liferay Docker image tag")
     run_parser.add_argument("-r", "--root", help="Project root path")
     run_parser.add_argument("-c", "--container", help="Container name")
     run_parser.add_argument("-f", "--follow", action="store_true", help="Follow logs after start")
+    run_parser.add_argument("--portal", action="store_true", help="Use Liferay Portal instead of DXP")
     run_parser.add_argument("--release-type", choices=["any", "u", "lts", "qr"], help="Tag discovery mode")
     run_parser.add_argument("--db", choices=["postgresql", "mysql", "hypersonic"], help="Database choice")
     run_parser.add_argument("--jdbc-username", help="Username for external DB")
@@ -776,14 +987,16 @@ def main():
     run_parser.add_argument("--recreate-db", action="store_true", help="Recreate DB if it exists")
     run_parser.add_argument("-p", "--port", type=int, help="Local HTTP port")
     run_parser.add_argument("--host-network", action="store_true", help="Use host networking")
+    run_parser.add_argument("--host-name", help="Virtual hostname for the instance")
+    run_parser.add_argument("--es-port", type=int, help="Elasticsearch sidecar HTTP port")
     run_parser.add_argument("--disable-zip64", action="store_true", help="Disable JVM Zip64 validation")
     run_parser.add_argument("--delete-state", action="store_true", help="Delete OSGi state before start")
     run_parser.add_argument("--remove-after", action="store_true", help="Remove container after stop")
     run_parser.add_argument("--non-interactive", action="store_true")
     run_parser.add_argument("--verbose", action="store_true")
 
-    # List command
-    subparsers.add_parser("list", help="List available snapshots")
+    # Snapshots command
+    subparsers.add_parser("snapshots", help="List available snapshots")
 
     # Snapshot command
     snap_parser = subparsers.add_parser("snapshot", help="Create a snapshot")
@@ -819,13 +1032,13 @@ def main():
     rest_parser.add_argument("--pg-host", help="PostgreSQL host override")
     rest_parser.add_argument("--pg-port", help="PostgreSQL port override")
     rest_parser.add_argument("--my-host", help="MySQL host override")
-    rest_parser.add_argument("--my-port", help="MySQL port override")
+    rest_parser.add_argument("--my-port", help="MySQL_port override")
     rest_parser.add_argument("--non-interactive", action="store_true")
     rest_parser.add_argument("--verbose", action="store_true")
 
     args = parser.parse_args()
     
-    if getattr(args, 'list', False) and not args.command:
+    if getattr(args, 'select', False) and not args.command:
         args.command = "run"
 
     if not args.command:
@@ -834,7 +1047,7 @@ def main():
 
     manager = LiferayManager(args)
     if args.command == "run": manager.cmd_run()
-    elif args.command == "list": manager.cmd_list()
+    elif args.command == "snapshots": manager.cmd_snapshots()
     elif args.command == "snapshot": manager.cmd_snapshot()
     elif args.command == "restore": manager.cmd_restore()
 
