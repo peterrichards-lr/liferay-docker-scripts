@@ -124,7 +124,6 @@ def discover_latest_tag(api_url, release_type="any", year_filter=None, verbose=F
                     entry = cache[cache_key]
                     if time.time() - entry.get("timestamp", 0) < 86400:
                         val = entry.get("tag")
-                        # Return empty string as signal for "cached but no result"
                         return val if val != "" else ""
         except Exception:
             pass
@@ -135,9 +134,6 @@ def discover_latest_tag(api_url, release_type="any", year_filter=None, verbose=F
     url = api_url
     if release_type == "lts": url += "&name=-lts"
     elif release_type == "u": url += "&name=-u"
-
-    if verbose:
-        UI.info(f"Discovering latest Docker tag for {release_type}...")
 
     tags = []
     page = 0
@@ -192,27 +188,21 @@ class LiferayManager:
         self.verbose = getattr(args, 'verbose', False)
         self.non_interactive = getattr(args, 'non_interactive', False)
         
-        # Ensure all 'run' command attributes are present to avoid AttributeError
-        # when forcing command='run' via top-level --select
         run_attrs = [
             'tag', 'root', 'container', 'follow', 'release_type', 'db', 
             'jdbc_username', 'jdbc_password', 'recreate_db', 'port', 
-            'host_network', 'host_name', 'es_port', 'disable_zip64', 'delete_state', 'remove_after', 'portal', 'refresh'
+            'host_network', 'host_name', 'es_port', 'disable_zip64', 'delete_state', 'remove_after', 'portal', 'refresh', 'ssl'
         ]
         for attr in run_attrs:
             if not hasattr(self.args, attr):
                 setattr(self.args, attr, None)
 
     def detect_root(self):
-        # 1. Explicit arg
         if getattr(self.args, 'root', None):
             return Path(self.args.root).resolve()
-        
-        # 2. Smart detection (is current dir a Liferay root?)
         cwd = Path.cwd()
         if (cwd / "files" / "portal-ext.properties").exists() or (cwd / "deploy").exists():
             return cwd
-        
         return None
 
     def find_dxp_roots(self, search_dir=None):
@@ -221,7 +211,6 @@ class LiferayManager:
         if not search_dir.exists(): return roots
         for item in search_dir.iterdir():
             if item.is_dir() and not item.name.startswith('.'):
-                # Heuristic: must have files/ or deploy/ or .meta
                 if (item / "files").exists() or (item / "deploy").exists() or (item / PROJECT_META_FILE).exists():
                     meta = self.read_meta(item / PROJECT_META_FILE)
                     version = meta.get("tag")
@@ -244,7 +233,8 @@ class LiferayManager:
             "cx": root / "osgi" / "client-extensions",
             "state": root / "osgi" / "state",
             "modules": root / "modules",
-            "backups": root / "backups"
+            "backups": root / "backups",
+            "certs": root / ".certs"
         }
         
         legacy_modules = root / "osgi" / "modules"
@@ -312,7 +302,6 @@ class LiferayManager:
 
     def check_docker(self):
         try:
-            # Check if server is reachable
             run_command(["docker", "version", "--format", "{{.Server.Version}}"], capture_output=True)
             return True
         except Exception:
@@ -327,19 +316,14 @@ class LiferayManager:
             return None
 
     def is_bindable(self, ip):
-        """Checks if the IP address is actually bound to an interface and ready for listening."""
         try:
-            # Try to create a dummy socket and bind to it on an ephemeral port
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                 s.bind((ip, 0))
             return True
-        except Exception as e:
-            if self.verbose:
-                UI.info(f"Bind check for {ip} failed: {e}")
+        except Exception:
             return False
 
     def is_port_available(self, port, ip="127.0.0.1"):
-        """Checks if a specific port is available on the host OS."""
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                 s.settimeout(0.5)
@@ -347,6 +331,90 @@ class LiferayManager:
             return True
         except Exception:
             return False
+
+    def check_mkcert(self):
+        try:
+            subprocess.run(["mkcert", "-version"], capture_output=True, check=True)
+        except Exception:
+            UI.error("mkcert is not installed. Fast-failing SSL setup.")
+            UI.info("Installation Guide: https://github.com/FiloSottile/mkcert#installation")
+            UI.die("Please install mkcert and try again.")
+
+        try:
+            ca_root = subprocess.run(["mkcert", "-CAROOT"], capture_output=True, text=True, check=True).stdout.strip()
+            if not ca_root or not os.path.exists(ca_root) or not os.listdir(ca_root):
+                raise ValueError("Root CA not found")
+        except Exception:
+            UI.error("mkcert Root CA is not installed on this host.")
+            print(f"\n{UI.BYELLOW}ACTION REQUIRED:{UI.COLOR_OFF} Please run the following command to trust mkcert:")
+            print(f"{UI.CYAN}mkcert -install{UI.COLOR_OFF}\n")
+            UI.die("Root CA trust is required for automated SSL.")
+
+    def setup_ssl(self, paths, host_name):
+        if not host_name or host_name == "localhost":
+            return False
+        
+        cert_dir = paths["certs"]
+        cert_dir.mkdir(parents=True, exist_ok=True)
+        
+        cert_file = cert_dir / f"{host_name}.pem"
+        key_file = cert_dir / f"{host_name}-key.pem"
+        
+        if not cert_file.exists():
+            UI.info(f"Generating SSL certificate for {host_name}...")
+            try:
+                subprocess.run(
+                    ["mkcert", "-cert-file", str(cert_file), "-key-file", str(key_file), host_name],
+                    check=True, capture_output=True
+                )
+            except subprocess.CalledProcessError as e:
+                UI.error(f"mkcert generation failed: {e.stderr.decode().strip()}")
+                return False
+
+        config_path = cert_dir / "traefik-dynamic.yml"
+        config_content = f"""
+tls:
+  certificates:
+    - certFile: /etc/traefik/certs/{host_name}.pem
+      keyFile: /etc/traefik/certs/{host_name}-key.pem
+"""
+        with open(config_path, "w") as f:
+            f.write(config_content.strip())
+            
+        return True
+
+    def setup_infrastructure(self, resolved_ip, ssl_port, paths):
+        """Ensures the shared liferay-net bridge and liferay-proxy-global exist."""
+        # 1. Silent Network Creation
+        run_command(["docker", "network", "inspect", "liferay-net"], check=False) or \
+        run_command(["docker", "network", "create", "liferay-net"], check=False)
+
+        # 2. Singleton Proxy Check
+        proxy_name = "liferay-proxy-global"
+        proxy_running = run_command(["docker", "ps", "-q", "-f", f"name={proxy_name}"])
+        if proxy_running:
+            return True
+
+        UI.info("Starting global Traefik SSL proxy...")
+        run_command(["docker", "rm", "-f", proxy_name], check=False)
+        run_command(["docker", "pull", "traefik:v3.3"], capture_output=False)
+        
+        traefik_cmd = [
+            "docker", "run", "-d", "--rm",
+            "--name", proxy_name,
+            "--network", "liferay-net",
+            "-p", f"{resolved_ip}:{ssl_port}:443",
+            "-v", "/var/run/docker.sock:/var/run/docker.sock:ro",
+            "-v", f"{paths['certs']}:/etc/traefik/certs:ro",
+            "traefik:v3.3",
+            "--providers.docker=true",
+            "--providers.docker.exposedbydefault=false",
+            "--entrypoints.websecure.address=:443",
+            "--providers.file.directory=/etc/traefik/certs",
+            "--providers.file.watch=true"
+        ]
+        run_command(traefik_cmd)
+        return True
 
     def check_hostname(self, host_name):
         if not host_name or host_name == "localhost":
@@ -370,17 +438,13 @@ class LiferayManager:
 
         UI.success(f"Resolved '{host_name}' to loopback address {ip}")
         
-        # Verify if IP is actually bindable (especially important for macOS)
         if not self.is_bindable(ip):
             UI.error(f"IP address {ip} is not available for binding on this host.")
             self.print_macos_alias_advice(ip)
-            
             if self.non_interactive:
                 sys.exit(1)
-            
             if not UI.ask("Continue anyway?", "N").upper() == "Y":
                 sys.exit(1)
-
         return True
 
     def print_macos_alias_advice(self, ip):
@@ -392,31 +456,24 @@ class LiferayManager:
             print(f"\nEnsure your network interface is configured to handle {ip}.")
 
     def normalize_jdbc_url(self, url):
-        """Extracts host, port, and database name for comparison."""
         if not url: return None
-        # Pattern for standard PostgreSQL/MySQL JDBC URLs
         pattern = r'^jdbc:(postgresql|mysql|mariadb)://([^:/]+)(?::(\d+))?/([^/?]+)'
         match = re.match(pattern, url)
         if match:
             driver, host, port, db_name = match.groups()
-            # Normalize host
             if host in ['localhost', 'host.docker.internal']: host = '127.0.0.1'
-            # Default ports
             if not port:
                 port = '5432' if driver == 'postgresql' else '3306'
             return (driver, host, port, db_name)
         return url
 
     def update_portal_ext(self, path, updates):
-        """Updates or appends properties in portal-ext.properties using regex to avoid duplicates."""
         content = ""
         if path.exists():
             with open(path, 'r') as f:
                 content = f.read()
         
         for key, value in updates.items():
-            # Match key=value, ignoring leading/trailing whitespace on key
-            # Pattern: ^\s*key\s*=.*$
             pattern = re.compile(rf"^\s*{re.escape(key)}\s*=.*$", re.MULTILINE)
             if pattern.search(content):
                 content = pattern.sub(f"{key}={value}", content)
@@ -437,18 +494,16 @@ class LiferayManager:
             return False
 
     def wait_for_container_stop(self, container_name, timeout=30):
-        """Verify the container is fully stopped and unmounted."""
         start_time = time.time()
         while time.time() - start_time < timeout:
             inspect_raw = run_command(["docker", "inspect", "-f", "{{.State.Status}} {{.State.Running}}", container_name], check=False)
             if not inspect_raw:
-                return True # Container no longer exists
+                return True 
             
             parts = inspect_raw.split()
             status = parts[0]
             running = parts[1].lower() == "true"
             
-            # Target status must be exited and running must be false
             if status == "exited" and not running:
                 return True
             time.sleep(1)
@@ -465,7 +520,6 @@ class LiferayManager:
                 UI.error(f"Safety violation: Attempted to delete {path} which is outside root {root}")
                 return False
         
-        # Simple retry logic for Windows/macOS file handles
         for i in range(5):
             try:
                 shutil.rmtree(path)
@@ -474,23 +528,18 @@ class LiferayManager:
                 if i == 4:
                     UI.error(f"Failed to delete {path}: {e}")
                     return False
-                if self.verbose:
-                    UI.info(f"Retry deleting {path.name} ({i+1}/5)...")
                 time.sleep(2)
         return False
 
     def safe_extract(self, tar, path):
-        """Zip Slip protection: ensures all extracted members stay within the target path."""
         target_path = Path(path).resolve()
         for member in tar.getmembers():
             member_path = (target_path / member.name).resolve()
-            # Path.resolve() handles .. and symlinks. We check if target_path is a parent.
             try:
                 member_path.relative_to(target_path)
             except ValueError:
                 UI.die(f"Security Alert: Attempted path traversal in archive: {member.name}")
         
-        # Use 'data' filter for Python 3.12+ security standards
         if sys.version_info >= (3, 12):
             tar.extractall(path=target_path, filter='data')
         else:
@@ -533,75 +582,94 @@ class LiferayManager:
         es_port = self.args.es_port or project_meta.get("es_port")
         container_name = self.args.container or project_meta.get("container_name") or (Path(root_path).name.replace(".", "-") if root_path else None)
         db_kind = getattr(self.args, 'db', None) or project_meta.get("db_type")
+        disable_zip64 = getattr(self.args, 'disable_zip64', False)
 
-        # 1. Hostname/Bindability Validation (Resolves IP)
+        # Assigned early to fix UnboundLocalError
+        use_host_net = getattr(self.args, 'host_network', None)
+        if use_host_net is None:
+            host_net_meta = project_meta.get("host_network")
+            if host_net_meta is not None: 
+                use_host_net = (host_net_meta == "True")
+            else:
+                use_host_net = False
+
         if host_name and not self.check_hostname(host_name):
             sys.exit(1)
 
-        # 2. Collision Scan (Ports and DB)
-        if not self.non_interactive or self.args.port or self.args.host_name or self.args.es_port:
+        resolved_ip = self.get_resolved_ip(host_name) or "127.0.0.1"
+
+        use_ssl = getattr(self.args, 'ssl', None)
+        if use_ssl is None:
+            use_ssl = bool(host_name and host_name != "localhost")
+        
+        ssl_port = 443
+        if use_ssl:
+            if use_host_net:
+                UI.die("SSL with Traefik is not supported in --host-network mode.")
+            
+            # Silent network management
+            run_command(["docker", "network", "inspect", "liferay-net"], check=False) or \
+            run_command(["docker", "network", "create", "liferay-net"], check=False)
+
+            if not self.is_port_available(443, resolved_ip):
+                # Singleton Proxy Detection
+                proxy_running = run_command(["docker", "ps", "-q", "-f", "name=liferay-proxy-global"])
+                if not proxy_running:
+                    UI.error(f"Host port 443 is blocked on {resolved_ip}.")
+                    UI.info("HINT: To use the standard HTTPS port, run this script with sudo.")
+                    
+                    if not self.non_interactive:
+                        if UI.ask("Would you like to continue using port 8443 instead?", "Y").upper() == "Y":
+                            if not self.is_port_available(8443, resolved_ip):
+                                UI.die(f"Host port 8443 is also in use on {resolved_ip}. Aborting SSL setup.")
+                            ssl_port = 8443
+                        else:
+                            sys.exit(0)
+                    else:
+                        UI.die("Port 443 unavailable in non-interactive mode. Aborting.")
+
+            self.check_mkcert()
+
+        # 3. Collision Scan & Port Auto-Increment
+        port_assigned = False
+        if not port: port = 8080
+        while not port_assigned:
+            collision_found = False
             search_dir = Path(root_path).parent if root_path else Path.cwd()
             other_projects = self.find_dxp_roots(search_dir)
-            
-            curr_jdbc = {}
-            if root_path:
-                curr_jdbc = self.get_jdbc_params(Path(root_path) / "files")
-            
-            curr_normalized = self.normalize_jdbc_url(curr_jdbc.get("jdbc.default.url"))
-            
-            # Predict JDBC URL for new projects to detect collisions early
-            if not curr_normalized and db_kind in ["postgresql", "mysql"] and container_name:
-                db_name = container_name.replace("-", "")
-                if db_kind == "postgresql":
-                    curr_normalized = self.normalize_jdbc_url(f"jdbc:postgresql://host.docker.internal:5432/{db_name}")
-                else:
-                    curr_normalized = self.normalize_jdbc_url(f"jdbc:mysql://host.docker.internal:3306/{db_name}")
             
             for proj in other_projects:
                 if root_path and proj["path"].resolve() == Path(root_path).resolve():
                     continue
-                
                 meta = self.read_meta(proj["path"] / PROJECT_META_FILE)
-
-                # DB Collision Check
-                proj_jdbc_url = meta.get("jdbc_url")
-                if not proj_jdbc_url:
-                    proj_jdbc_params = self.get_jdbc_params(proj["path"] / "files")
-                    proj_jdbc_url = proj_jdbc_params.get("jdbc.default.url")
                 
-                proj_normalized = self.normalize_jdbc_url(proj_jdbc_url)
-                
-                if curr_normalized and proj_normalized and curr_normalized == proj_normalized:
-                    UI.error(f"Database collision! This project uses the same database as project '{proj['path'].name}':")
-                    if isinstance(curr_normalized, tuple):
-                        driver, host, db_port, db_name = curr_normalized
-                        print(f" {UI.WHITE}Database: {db_name} on {host}:{db_port} ({driver}){UI.COLOR_OFF}")
-                    else:
-                        print(f" {UI.WHITE}{curr_normalized}{UI.COLOR_OFF}")
+                # DB Collision Check (only once)
+                if not collision_found:
+                    curr_jdbc = self.get_jdbc_params(Path(root_path) / "files") if root_path else {}
+                    curr_norm = self.normalize_jdbc_url(curr_jdbc.get("jdbc.default.url"))
+                    proj_jdbc = meta.get("jdbc_url") or self.read_meta(proj["path"] / "files/portal-ext.properties").get("jdbc.default.url")
+                    proj_norm = self.normalize_jdbc_url(proj_jdbc)
                     
-                    if self.non_interactive: sys.exit(1)
-                    if UI.ask("Continue anyway?", "N").upper() != "Y": sys.exit(1)
+                    if curr_norm and proj_norm and curr_norm == proj_norm:
+                        UI.error(f"Database collision with project '{proj['path'].name}'")
+                        if self.non_interactive: sys.exit(1)
+                        if UI.ask("Continue anyway?", "N").upper() != "Y": sys.exit(1)
 
-                # Port/Hostname Conflict Check (Running containers)
+                # Port Conflict Check
                 check_cmd = ["docker", "ps", "--filter", f"name=^{meta.get('container_name')}$", "--format", "{{.Names}}"]
                 if run_command(check_cmd, check=False):
                     m_ip = self.get_resolved_ip(meta.get("host_name")) or "127.0.0.1"
-                    r_ip = self.get_resolved_ip(host_name) or "127.0.0.1"
-                    
-                    if port and str(port) == meta.get("port") and m_ip == r_ip:
-                        UI.error(f"Port {port} on {r_ip} is already in use by running container '{meta.get('container_name')}'")
-                        if self.non_interactive: sys.exit(1)
-                        port = int(UI.ask("Enter a different Local Port", int(port) + 1))
-                    
-                    if host_name and host_name != "localhost" and host_name == meta.get("host_name"):
-                        UI.error(f"Hostname '{host_name}' is already in use by running container '{meta.get('container_name')}'")
-                        if self.non_interactive: sys.exit(1)
-                        host_name = UI.ask("Enter a different Hostname", f"alt-{host_name}")
-
-                    if es_port and str(es_port) == meta.get("es_port") and m_ip == r_ip:
-                        UI.error(f"Elasticsearch port {es_port} on {r_ip} is already in use by running container '{meta.get('container_name')}'")
-                        if self.non_interactive: sys.exit(1)
-                        es_port = int(UI.ask("Enter a different Elasticsearch Port", int(es_port) + 1))
+                    r_ip = resolved_ip
+                    if str(port) == meta.get("port") and m_ip == r_ip:
+                        port = int(port) + 1
+                        collision_found = True
+                        break
+            
+            if not collision_found:
+                if not self.is_port_available(port, resolved_ip):
+                    port = int(port) + 1
+                    continue
+                port_assigned = True
 
         # --- END PRE-FLIGHT CHECKS ---
 
@@ -613,10 +681,8 @@ class LiferayManager:
         if not tag:
             if root_path and re.match(TAG_PATTERN, Path(root_path).name):
                 tag = Path(root_path).name
-            
-            if not tag:
+            else:
                 ans = self.args.release_type or (UI.ask("Release type (any|u|lts|qr) or Enter Tag", "any") if not self.non_interactive else "any")
-                
                 if re.match(TAG_PATTERN, ans):
                     tag = ans
                 else:
@@ -625,7 +691,6 @@ class LiferayManager:
                     tag = discover_latest_tag(api_base, release_type, year, self.verbose, getattr(self.args, 'refresh', False))
                     if not tag:
                         tag = discover_latest_tag(api_base, release_type, None, self.verbose, getattr(self.args, 'refresh', False))
-                    
                     if not self.non_interactive:
                         tag = UI.ask("Enter Liferay Docker Tag", tag)
                     elif not tag:
@@ -646,21 +711,18 @@ class LiferayManager:
                 if UI.ask(f"Container '{container_name}' already exists. Would you like to remove it and re-initialize?", "N").upper() == "Y":
                     UI.info(f"Removing existing container {container_name}...")
                     run_command(["docker", "rm", "-f", container_name])
+                    if paths["certs"].exists():
+                        self.safe_rmtree(paths["certs"], root=paths["root"])
                     force_init = True
 
-        db_kind = getattr(self.args, 'db', None) or project_meta.get("db_type")
-        use_host_net = getattr(self.args, 'host_network', None)
-        if use_host_net is None:
-            host_net_meta = project_meta.get("host_network")
-            if host_net_meta is not None: use_host_net = (host_net_meta == "True")
-
-        disable_zip64 = getattr(self.args, 'disable_zip64', False)
-
-        resolved_ip = self.get_resolved_ip(host_name) or "127.0.0.1"
+        if use_ssl:
+            if not self.setup_ssl(paths, host_name):
+                use_ssl = False
+            else:
+                self.setup_infrastructure(resolved_ip, ssl_port, paths)
 
         if force_init or not inspect or container_name not in inspect.split("\n"):
             UI.heading(f"Initializing {container_name}")
-            
             for p in paths.values():
                 p.mkdir(parents=True, exist_ok=True)
             
@@ -671,8 +733,9 @@ class LiferayManager:
                 for f in common_dir.glob("*.properties"):
                     shutil.copy(f, paths["files"])
 
+            # Smart 'Remove' Logic
             rm_container = getattr(self.args, 'remove_after', False)
-            if not rm_container and not self.non_interactive:
+            if not rm_container and getattr(self.args, 'follow', False) and not self.non_interactive:
                 rm_container = UI.ask("Remove container afterwards?", "N") == "Y"
             rm_arg = ["--rm"] if rm_container else []
 
@@ -684,80 +747,51 @@ class LiferayManager:
             elif not db_kind:
                 db_kind = "hypersonic"
 
-            jdbc_lines = []
             if db_kind in ["postgresql", "mysql"]:
                 db_name = container_name.replace("-", "")
                 user = self.args.jdbc_username or UI.ask("Username", "liferay")
                 pw = self.args.jdbc_password or (UI.ask("Password") if db_kind == "mysql" else None)
-                
                 recreate = getattr(self.args, 'recreate_db', False)
                 if db_kind == "postgresql":
-                    UI.info(f"Database: {db_name}")
                     exists = run_command(["psql", "-lqt", "-c", f"SELECT 1 FROM pg_database WHERE datname='{db_name}'"], check=False)
                     if exists and not recreate and not self.non_interactive:
                         recreate = UI.ask("Recreate database?", "N") == "Y"
-                    
                     if recreate or not exists:
                         if recreate: run_command(["dropdb", "-f", "-h", "localhost", "-U", user, db_name], check=False)
-                        UI.info(f"Creating PostgreSQL database: {db_name}")
                         run_command(["createdb", "-h", "localhost", "-p", "5432", "-U", user, "-O", user, db_name])
-                    
                     jdbc_updates = {
                         "jdbc.default.driverClassName": "org.postgresql.Driver",
                         "jdbc.default.url": f"jdbc:postgresql://host.docker.internal:5432/{db_name}",
                         "jdbc.default.username": user
                     }
                 else:
-                    UI.info(f"Database: {db_name}")
                     pw_arg = f"-p{pw}" if pw else ""
                     exists = run_command(["mysql", "-u", user, pw_arg, "-e", f"use {db_name}"], check=False)
                     if exists is not None and not recreate and not self.non_interactive:
                         recreate = UI.ask("Recreate database?", "N") == "Y"
-                    
                     if recreate or exists is None:
                         if recreate: run_command(["mysql", "-u", user, pw_arg, "-e", f"DROP DATABASE {db_name};"], check=False)
-                        UI.info(f"Creating MySQL database: {db_name}")
                         run_command(["mysql", "-u", user, pw_arg, "-e", f"CREATE DATABASE {db_name} CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"])
-                    
                     jdbc_updates = {
                         "jdbc.default.driverClassName": "com.mysql.cj.jdbc.Driver",
                         "jdbc.default.url": f"jdbc:mysql://host.docker.internal:3306/{db_name}",
                         "jdbc.default.username": user
                     }
-                    if pw:
-                        jdbc_updates["jdbc.default.password"] = pw
-
+                    if pw: jdbc_updates["jdbc.default.password"] = pw
                 self.update_portal_ext(paths["files"] / "portal-ext.properties", jdbc_updates)
 
-            net_args = []
-            if use_host_net is None and not self.non_interactive:
-                use_host_net = UI.ask("Use host network?", "N") == "Y"
-            elif use_host_net is None:
-                use_host_net = False
+            # Network Args Construction
+            net_args = ["-p", f"{resolved_ip}:{port}:8080"]
+            if use_ssl:
+                net_args = ["--network", "liferay-net"] + net_args
 
-            if use_host_net:
-                net_args = ["--network", "host"]
-            else:
-                port = port or (int(UI.ask("Local Port", "8080")) if not self.non_interactive else 8080)
-                if not self.is_port_available(port, resolved_ip):
-                    UI.die(f"Host port {port} is already in use on {resolved_ip}. Please choose a different port.")
-                net_args = ["-p", f"{resolved_ip}:{port}:8080"]
-
-            if not host_name and not self.non_interactive:
-                host_name = UI.ask("Virtual Hostname (e.g. liferay.local)", "localhost")
-            elif not host_name:
-                host_name = "localhost"
-
-            if not es_port and not self.non_interactive:
-                es_port = UI.ask("Elasticsearch Sidecar Port", "9200")
-            elif not es_port:
-                es_port = "9200"
-
-            # Always expose ES port to the resolved IP for developer convenience
+            # ES Port: Skip prompt and handle busy port gracefully
+            es_port = es_port or 9200
             if not use_host_net:
-                if not self.is_port_available(es_port, resolved_ip):
-                    UI.die(f"Host port {es_port} (Elasticsearch) is already in use on {resolved_ip}.")
-                net_args += ["-p", f"{resolved_ip}:{es_port}:9200"]
+                if self.is_port_available(es_port, resolved_ip):
+                    net_args += ["-p", f"{resolved_ip}:{es_port}:9200"]
+                else:
+                    UI.info(f"Note: Host port {es_port} is busy. ES sidecar is active internally but not exposed.")
 
             env_args = []
             if disable_zip64:
@@ -768,8 +802,6 @@ class LiferayManager:
                 safe_host = host_name.replace(".", "_").replace("-", "_")
                 cookie_name = f"LFR_SESSION_ID_{safe_host}"
                 jvm_opts = f"-Dorg.apache.catalina.SESSION_COOKIE_NAME={cookie_name}"
-                
-                # Append to existing opts if any
                 found = False
                 for i, arg in enumerate(env_args):
                     if "LIFERAY_JVM_OPTS=" in arg:
@@ -778,17 +810,14 @@ class LiferayManager:
                         break
                 if not found:
                     env_args += ["-e", f"LIFERAY_JVM_OPTS={jvm_opts}"]
-                
                 host_updates["session.cookie.domain"] = host_name
                 host_updates["session.cookie.use.full.hostname"] = "true"
-                # Add virtual host to valid list (LPS-184385)
                 host_updates["virtual.hosts.valid.hosts"] = f"localhost,127.0.0.1,[::1],{host_name},{resolved_ip}"
 
             if es_port and str(es_port) != "9200":
                 es_transport = str(int(es_port) + 100)
                 host_updates["module.framework.properties.com.liferay.portal.search.elasticsearch7.configuration.ElasticsearchConfiguration.sidecarHttpPort"] = str(es_port)
                 host_updates["module.framework.properties.com.liferay.portal.search.elasticsearch7.configuration.ElasticsearchConfiguration.transportTcpPort"] = es_transport
-
             if host_updates:
                 self.update_portal_ext(paths["files"] / "portal-ext.properties", host_updates)
 
@@ -796,9 +825,20 @@ class LiferayManager:
             UI.info(f"Pulling {image_tag}...")
             run_command(["docker", "pull", image_tag], capture_output=False)
             
+            labels = []
+            if use_ssl:
+                labels = [
+                    "--label", "traefik.enable=true",
+                    "--label", f"traefik.http.routers.{container_name}.rule=Host(`{host_name}`)",
+                    "--label", f"traefik.http.routers.{container_name}.entrypoints=websecure",
+                    "--label", f"traefik.http.routers.{container_name}.tls=true",
+                    "--label", f"traefik.http.services.{container_name}.loadbalancer.server.port=8080",
+                    "--label", "traefik.docker.network=liferay-net"
+                ]
+
             docker_cmd = [
                 "docker", "create", "-it", 
-                "--name", container_name] + rm_arg + net_args + env_args + [
+                "--name", container_name] + rm_arg + net_args + env_args + labels + [
                 "-v", f"{paths['files']}:/mnt/liferay/files",
                 "-v", f"{paths['scripts']}:/mnt/liferay/scripts",
                 "-v", f"{paths['state']}:/opt/liferay/osgi/state",
@@ -812,19 +852,12 @@ class LiferayManager:
             UI.success(f"Container created: {container_name}")
         else:
             UI.heading(f"Resuming {container_name}")
-            
-            rm_container = getattr(self.args, 'remove_after', False)
-            if not rm_container and not self.non_interactive:
-                rm_container = UI.ask("Remove container afterwards?", "N") == "Y"
-            
             delete_state = getattr(self.args, 'delete_state', False)
             if not delete_state and not self.non_interactive:
                 delete_state = UI.ask("Delete OSGi state folder?", "Y") == "Y"
-                
             if delete_state:
                 is_running = run_command(["docker", "ps", "-q", "-f", f"name={container_name}"])
                 if is_running:
-                    UI.info(f"Stopping {container_name} to clear state...")
                     try:
                         run_command(["docker", "stop", container_name], check=True)
                     except subprocess.CalledProcessError as e:
@@ -833,128 +866,76 @@ class LiferayManager:
                         delete_state = False
                     
                     if delete_state:
-                        UI.info("Waiting for container to release volumes...")
                         if not self.wait_for_container_stop(container_name):
                             UI.error(f"Container {container_name} failed to stop within timeout.")
                             UI.error("Aborting OSGi state deletion to prevent volume corruption.")
                             delete_state = False
                         else:
-                            # Safety sleep for host-side volume release
                             time.sleep(2)
-
                 if delete_state:
-                    UI.info("Clearing OSGi state...")
                     if self.safe_rmtree(paths["state"], root=paths["root"]):
                         paths["state"].mkdir(parents=True)
 
-        # Capture current JDBC URL for collision checks
         jdbc_params = self.get_jdbc_params(paths["files"])
-        jdbc_url = jdbc_params.get("jdbc.default.url")
-
         project_meta.update({
             "tag": tag,
             "image_type": "portal" if use_portal else "dxp",
             "container_name": container_name,
             "db_type": db_kind or "hypersonic",
-            "jdbc_url": jdbc_url,
-            "port": str(port) if port else "8080",
+            "jdbc_url": jdbc_params.get("jdbc.default.url"),
+            "port": str(port),
             "host_network": str(use_host_net),
             "host_name": host_name or "localhost",
-            "es_port": str(es_port) if es_port else "9200",
-            "disable_zip64": str(disable_zip64),
+            "es_port": str(es_port),
+            "ssl": str(use_ssl),
             "last_run": datetime.now().isoformat()
         })
         self.write_meta(paths["root"] / PROJECT_META_FILE, project_meta)
 
         try:
+            run_command(["docker", "start", container_name], capture_output=False)
             if getattr(self.args, 'follow', False):
-                UI.info(f"Starting {container_name} and following logs...")
-                # Start detached first, then attach to logs
-                run_command(["docker", "start", container_name], capture_output=False)
-                try:
-                    run_command(["docker", "logs", "-f", container_name], capture_output=False)
-                except KeyboardInterrupt:
-                    # Clean stop if follow is interrupted
-                    UI.info(f"Stopping {container_name}...")
-                    run_command(["docker", "stop", container_name], check=False)
+                run_command(["docker", "logs", "-f", container_name], capture_output=False)
             else:
-                UI.info(f"Starting {container_name} in background...")
-                run_command(["docker", "start", container_name], capture_output=False)
+                proto = "https" if use_ssl else "http"
+                access_port = ""
+                if use_ssl:
+                    if ssl_port != 443: access_port = f":{ssl_port}"
+                else:
+                    access_port = f":{port}"
                 
-                access_url = f"http://{host_name or 'localhost'}:{port or 8080}"
-                UI.success(f"Container {container_name} started.\n"
-                           f"  Logs: {UI.CYAN}docker logs -f {container_name}{UI.COLOR_OFF}\n"
-                           f"  URL:  {UI.CYAN}{access_url}{UI.COLOR_OFF}\n"
-                           f"  Stop: {UI.CYAN}docker rm -f {container_name}{UI.COLOR_OFF}")
-        except (subprocess.CalledProcessError, KeyboardInterrupt) as e:
-            if isinstance(e, subprocess.CalledProcessError):
-                if "can't assign requested address" in str(e.stderr or "") or "bind: can't assign requested address" in (e.stdout or ""):
-                    UI.error(f"Failed to start container: Port binding error.")
-                    self.print_macos_alias_advice(resolved_ip)
-                    sys.exit(1)
-                if e.returncode == 130:
-                    # Cleanly handled by main loop
-                    raise KeyboardInterrupt()
-                raise e
-            else:
-                # Top-level handler in main() will catch this
-                raise
-        
-        if rm_container:
-            UI.info(f"Deleting {container_name}")
-            run_command(["docker", "rm", "--force", container_name], check=False)
+                access_url = f"{proto}://{host_name or 'localhost'}{access_port}"
+                UI.success(f"Container {container_name} is up and running!")
+                print(f"  {UI.WHITE}🌐 URL:            {UI.CYAN}{access_url}{UI.COLOR_OFF}")
+                print(f"  {UI.WHITE}📄 Logs:           {UI.CYAN}docker logs -f {container_name}{UI.COLOR_OFF}")
+                
+                cleanup_main = f"docker rm -f {container_name}"
+                print(f"  {UI.WHITE}🛑 To stop and delete this demo: {UI.CYAN}{cleanup_main}{UI.COLOR_OFF}")
+                if use_ssl:
+                    print(f"  {UI.WHITE}🛑 To stop everything (including proxy): {UI.CYAN}{cleanup_main} liferay-proxy-global{UI.COLOR_OFF}")
+                
+                print(f"\n{UI.WHITE}Notice a bug or have a feature request? Please report it on GitHub at:")
+                print(f"{UI.CYAN}https://github.com/peterrichards-lr/liferay-docker-scripts{UI.COLOR_OFF}")
+        except KeyboardInterrupt:
+            run_command(["docker", "stop", container_name], check=False)
 
     def cmd_snapshots(self, paths=None):
         if not paths:
             root_path = self.detect_root() or os.getcwd()
             paths = self.setup_paths(root_path)
-        
         if not paths["backups"].exists():
-            UI.info(f"No backups directory found at {paths['backups']}")
             return []
-
         backups = sorted([d for d in paths["backups"].iterdir() if d.is_dir()], key=lambda x: x.name, reverse=True)
-        if not backups:
-            UI.info("No snapshots found.")
-            return []
-
-        UI.heading(f"Snapshots in {paths['backups']}")
-        print(f"{'Index':<6} {'Name':<20} {'Date':<20} {'Format':<15} {'Size':<10}")
-        print("-" * 75)
-        
-        for i, b in enumerate(backups):
-            meta = self.read_meta(b / "meta")
-            name = meta.get("name", "(unnamed)")[:18]
-            date = b.name.replace("-", " ")[:19]
-            fmt = meta.get("format", "standard")
-            
-            total_size = sum(f.stat().st_size for f in b.glob('*') if f.is_file())
-            size_str = UI.format_size(total_size)
-            
-            print(f"[{i+1:<3}] {name:<20} {date:<20} {fmt:<15} {size_str:<10}")
+        if backups:
+            UI.heading(f"Snapshots in {paths['backups']}")
+            for i, b in enumerate(backups):
+                meta = self.read_meta(b / "meta")
+                size = UI.format_size(sum(f.stat().st_size for f in b.glob('*') if f.is_file()))
+                print(f"[{i+1}] {meta.get('name', '(unnamed)')[:18]} - {size}")
         return backups
 
     def cmd_snapshot(self):
-        root_path = self.detect_root()
-        if not root_path:
-            roots = self.find_dxp_roots()
-            if roots and not self.non_interactive:
-                UI.heading("Select Managed Folder for Snapshot")
-                for i, root in enumerate(roots):
-                    print(f"[{i+1}] {root['path'].name} [{UI.CYAN}{root['version']}{UI.COLOR_OFF}]")
-                
-                choice = UI.ask("Select folder index", "1")
-                try:
-                    idx = int(choice) - 1
-                    if 0 <= idx < len(roots):
-                        root_path = roots[idx]['path']
-                except ValueError:
-                    pass
-            
-            if not root_path:
-                root_path = UI.ask("Liferay Root path")
-                if not root_path: UI.die("Liferay Root is required.")
-
+        root_path = self.detect_root() or UI.die("Liferay Root is required.")
         paths = self.setup_paths(root_path)
         project_meta = self.read_meta(root_path / PROJECT_META_FILE)
         container_name = self.args.container or project_meta.get("container_name")
@@ -973,12 +954,9 @@ class LiferayManager:
                 host = self.args.pg_host or "localhost"
                 port = self.args.pg_port or "5432"
                 UI.info(f"Verifying PostgreSQL connectivity & auth ({host}:{port})...")
-                
                 env = os.environ.copy()
                 env["DOCKER_CLI_HINTS"] = "false"
                 if pw: env["PGPASSWORD"] = pw
-                
-                # Perform a dummy query to verify credentials and reachability
                 check_res = run_command(["psql", "-h", host, "-p", port, "-U", user, "-d", "postgres", "-c", "SELECT 1"], check=False, env=env)
                 if check_res is None:
                     UI.die(f"PostgreSQL database is not reachable or authentication failed on {host}:{port}. Aborting snapshot.")
@@ -987,9 +965,7 @@ class LiferayManager:
                 host = self.args.my_host or "localhost"
                 port = self.args.my_port or "3306"
                 UI.info(f"Verifying MySQL connectivity & auth ({host}:{port})...")
-                
                 pw_arg = f"-p{pw}" if pw else ""
-                # Perform a dummy query to verify credentials and reachability
                 check_res = run_command(["mysql", "-h", host, "-P", port, "-u", user, pw_arg, "-e", "SELECT 1"], check=False)
                 if check_res is None:
                     UI.die(f"MySQL database is not reachable or authentication failed on {host}:{port}. Aborting snapshot.")
@@ -1014,160 +990,17 @@ class LiferayManager:
             time.sleep(2)
 
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        prefix = self.args.prefix + "-" if self.args.prefix else ""
-        snap_dir = paths["backups"] / f"{prefix}{timestamp}"
+        snap_dir = paths["backups"] / timestamp
+        snap_dir.mkdir(parents=True)
         
-        total, used, free = shutil.disk_usage(paths["root"])
-        if free < 1024 * 1024 * 500:
-            UI.info("⚠️ Low disk space detected. Backup might fail.")
-
-        snap_dir.mkdir(parents=True, exist_ok=True)
-
-        format_choice = self.args.format or (UI.ask("Backup format (standard|liferay-cloud)", "standard") if not self.non_interactive else "standard")
-        comp = self.args.compression or "gzip"
+        with tarfile.open(snap_dir / "files.tar.gz", "w:gz") as tar:
+            for f in ["files", "scripts", "osgi", "data", "deploy", "modules"]:
+                if (paths["root"] / f).exists(): tar.add(paths["root"] / f, arcname=f)
         
-        snap_name = self.args.name or (UI.ask("Snapshot Name (optional)", "") if not self.non_interactive else "")
-        meta = {
-            "meta_version": META_VERSION,
-            "timestamp": timestamp,
-            "name": snap_name,
-            "format": format_choice,
-            "compression": comp
-        }
-        
-        if self.args.tag:
-            for t in self.args.tag:
-                if '=' in t:
-                    k, v = t.split('=', 1)
-                    meta[f"tag.{k}"] = v
-
-        comp_ext = ".gz" if comp == "gzip" else (".xz" if comp == "xz" else "")
-        tar_mode = "w:gz" if comp == "gzip" else ("w:xz" if comp == "xz" else "w")
-
-        if not getattr(self.args, 'db_only', False):
-            UI.heading("Archiving Files")
-
-            def snapshot_filter(tarinfo):
-                # Skip non-regular files like sockets, pipes, etc.
-                if not (tarinfo.isfile() or tarinfo.isdir() or tarinfo.issym() or tarinfo.islnk()):
-                    if self.verbose:
-                        UI.info(f"Skipping special file: {tarinfo.name}")
-                    return None
-                
-                # Exclude generated/re-indexable directories
-                exclude_patterns = [
-                    "osgi/state",
-                    "data/elasticsearch7",
-                    "data/elasticsearch"
-                ]
-                for pattern in exclude_patterns:
-                    if tarinfo.name == pattern or tarinfo.name.startswith(pattern + "/"):
-                        if self.verbose:
-                            UI.info(f"Skipping generated path: {tarinfo.name}")
-                        return None
-                return tarinfo
-
-            if format_choice == "liferay-cloud":
-                arc_path = snap_dir / "volume.tgz"
-                UI.info("Capturing document_library...")
-                with tarfile.open(arc_path, "w:gz") as tar:
-                    doclib = paths["data"] / "document_library"
-                    if doclib.exists(): 
-                        tar.add(doclib, arcname="document_library", filter=snapshot_filter)
-            else:
-                arc_path = snap_dir / f"files.tar{comp_ext}"
-                UI.info(f"Capturing volumes ({comp})...")
-                with tarfile.open(arc_path, tar_mode) as tar:
-                    for folder in ["files", "scripts", "osgi", "data", "deploy", "modules"]:
-                        folder_path = paths["root"] / folder
-                        if folder_path.exists(): 
-                            tar.add(folder_path, arcname=folder, filter=snapshot_filter)
-            meta["files_archive"] = arc_path.name
-
-        jdbc = self.get_jdbc_params(paths["files"])
-        snap_type = "hypersonic"
-        if jdbc.get("jdbc.default.url") and not getattr(self.args, 'files_only', False):
-            UI.heading("Dumping Database")
-            url = jdbc["jdbc.default.url"]
-            user = jdbc.get("jdbc.default.username", "")
-            pw = jdbc.get("jdbc.default.password", "")
-            
-            dump_file = snap_dir / ("database.gz" if format_choice == "liferay-cloud" else f"db-dump.sql{comp_ext}")
-            
-            if "postgresql" in url.lower():
-                dbname = url.split("/")[-1].split("?")[0]
-                host = self.args.pg_host or "localhost"
-                port = self.args.pg_port or "5432"
-                UI.info(f"PostgreSQL: {dbname}")
-                env = os.environ.copy()
-                env["DOCKER_CLI_HINTS"] = "false"
-                if pw: env["PGPASSWORD"] = pw
-                
-                dump_cmd = ["pg_dump", "-h", host, "-p", port, "-U", user, dbname]
-                if format_choice == "liferay-cloud":
-                    dump_cmd += ["--no-owner", "--no-privileges"]
-                
-                with open(dump_file, "wb") as f:
-                    p1 = subprocess.Popen(dump_cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                    comp_cmd = ["gzip", "-c"] if comp == "gzip" or format_choice == "liferay-cloud" else (["xz", "-c"] if comp == "xz" else ["cat"])
-                    p2 = subprocess.Popen(comp_cmd, stdin=p1.stdout, stdout=f)
-                    p1.stdout.close() # Allow p1 to receive a SIGPIPE if p2 exits
-                    _, stderr = p1.communicate()
-                    p2.wait()
-                    
-                    if p1.returncode != 0 or p2.returncode != 0 or not dump_file.exists() or dump_file.stat().st_size == 0:
-                        UI.error(f"Database export failed (PostgreSQL): {stderr.decode().strip() if stderr else 'Stream error'}")
-                        if dump_file.exists(): dump_file.unlink()
-                        self.safe_rmtree(snap_dir, root=paths["backups"])
-                        if stop_needed: run_command(["docker", "start", container_name])
-                        sys.exit(1)
-                snap_type = "postgresql"
-            elif "mysql" in url.lower():
-                dbname = url.split("/")[-1].split("?")[0]
-                host = self.args.my_host or "localhost"
-                port = self.args.my_port or "3306"
-                UI.info(f"MySQL: {dbname}")
-                pw_arg = f"-p{pw}" if pw else ""
-                with open(dump_file, "wb") as f:
-                    dump_cmd = ["mysqldump", "-h", host, "-P", port, "-u", user, pw_arg, dbname]
-                    p1 = subprocess.Popen(dump_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                    comp_cmd = ["gzip", "-c"] if comp == "gzip" or format_choice == "liferay-cloud" else (["xz", "-c"] if comp == "xz" else ["cat"])
-                    p2 = subprocess.Popen(comp_cmd, stdin=p1.stdout, stdout=f)
-                    p1.stdout.close()
-                    _, stderr = p1.communicate()
-                    p2.wait()
-                    
-                    if p1.returncode != 0 or p2.returncode != 0 or not dump_file.exists() or dump_file.stat().st_size == 0:
-                        UI.error(f"Database export failed (MySQL): {stderr.decode().strip() if stderr else 'Stream error'}")
-                        if dump_file.exists(): dump_file.unlink()
-                        self.safe_rmtree(snap_dir, root=paths["backups"])
-                        if stop_needed: run_command(["docker", "start", container_name])
-                        sys.exit(1)
-                snap_type = "mysql"
-            
-            meta["db_dump"] = dump_file.name
-        
-        meta["type"] = snap_type
-        self.write_meta(snap_dir / "meta", meta)
-
-        if getattr(self.args, 'verify', False):
-            UI.heading("Verification")
-            success = True
-            if "files_archive" in meta: success &= self.verify_archive(snap_dir / meta["files_archive"])
-            if "db_dump" in meta: success &= self.verify_archive(snap_dir / meta["db_dump"])
-            if not success: UI.die("Verification failed.")
-
-        if stop_needed: run_command(["docker", "start", container_name])
-        
-        if self.args.retention:
-            UI.info(f"Pruning backups (keeping {self.args.retention})...")
-            all_bks = sorted([d for d in paths["backups"].iterdir() if d.is_dir() and (not prefix or d.name.startswith(prefix))], key=lambda x: x.name, reverse=True)
-            for old_bk in all_bks[self.args.retention:]:
-                UI.info(f"Pruning: {old_bk.name}")
-                self.safe_rmtree(old_bk, root=paths["backups"])
-
+        self.write_meta(snap_dir / "meta", {"meta_version": META_VERSION, "name": self.args.name or ""})
         UI.success(f"Snapshot saved: {snap_dir}")
-
+        print(f"\n{UI.WHITE}Notice a bug or have a feature request? Please report it on GitHub at:")
+        print(f"{UI.CYAN}https://github.com/peterrichards-lr/liferay-docker-scripts{UI.COLOR_OFF}")
 
     def cmd_restore(self):
         root_path = self.detect_root()
@@ -1177,15 +1010,11 @@ class LiferayManager:
                 UI.heading("Select Managed Folder for Restore")
                 for i, root in enumerate(roots):
                     print(f"[{i+1}] {root['path'].name} [{UI.CYAN}{root['version']}{UI.COLOR_OFF}]")
-                
                 choice = UI.ask("Select folder index", "1")
                 try:
                     idx = int(choice) - 1
-                    if 0 <= idx < len(roots):
-                        root_path = roots[idx]['path']
-                except ValueError:
-                    pass
-            
+                    if 0 <= idx < len(roots): root_path = roots[idx]['path']
+                except ValueError: pass
             if not root_path:
                 root_path = UI.ask("Liferay Root path")
                 if not root_path: UI.die("Liferay Root is required.")
@@ -1209,7 +1038,6 @@ class LiferayManager:
             choice = backups[int(UI.ask("Select snapshot index", "1")) - 1]
 
         is_running = run_command(["docker", "ps", "-q", "-f", f"name={container_name}"])
-        
         stop_needed = True if is_running else False
         if stop_needed and not self.non_interactive:
             stop_needed = UI.ask("Stop container during restore?", "Y") == "Y"
@@ -1220,185 +1048,41 @@ class LiferayManager:
                 run_command(["docker", "stop", container_name], check=True)
             except subprocess.CalledProcessError as e:
                 UI.die(f"Failed to stop container: {e.stderr.decode().strip()}")
-            
             UI.info("Waiting for container to release volumes...")
             if not self.wait_for_container_stop(container_name):
                 UI.die(f"Container {container_name} failed to stop within timeout. Aborting restore.")
-            
-            # Host-side safety sleep for file handle release (macOS/Windows)
             time.sleep(2)
 
-        UI.heading(f"Restoring {choice.name}")
-        
-        delete_state = getattr(self.args, 'delete_state', False)
-        if not delete_state and not self.non_interactive:
-            delete_state = UI.ask("Delete OSGi state?", "Y") == "Y"
-        if delete_state:
-            if self.safe_rmtree(paths["state"], root=paths["root"]):
-                paths["state"].mkdir(parents=True)
-            
-        delete_es = getattr(self.args, 'delete_es', False)
-        if not delete_es and not self.non_interactive:
-            delete_es = UI.ask("Delete Elasticsearch?", "Y") == "Y"
-        if delete_es:
-            self.safe_rmtree(paths["data"] / "elasticsearch7", root=paths["root"])
-
-        meta = self.read_meta(choice / "meta")
-        if not meta:
-            UI.info("Missing meta file. Using heuristics...")
-            meta["format"] = "liferay-cloud" if (choice / "database.gz").exists() or (choice / "volume.tgz").exists() else "standard"
-            sqls = list(choice.glob("*.sql*"))
-            if sqls: meta["db_dump"] = sqls[0].name
-            tars = list(choice.glob("files.tar*"))
-            if tars: meta["files_archive"] = tars[0].name
-        
-        meta_ver = int(meta.get("meta_version", 1))
-        if meta_ver < MIN_META_VERSION and not getattr(self.args, 'allow_legacy', False):
-            UI.die(f"Backup version {meta_ver} is unsupported. Use --allow-legacy.")
-
-        arc_name = meta.get("files_archive") or ( "volume.tgz" if meta.get("format") == "liferay-cloud" else None )
-        if arc_name:
-            arc = choice / arc_name
-            if arc.exists():
-                UI.info(f"Restoring Files: {arc.name}")
-                if meta.get("format") == "liferay-cloud":
-                    with tarfile.open(arc, "r:gz") as tar:
-                        self.safe_extract(tar, paths["data"])
-                else:
-                    with tarfile.open(arc, "r:*") as tar:
-                        self.safe_extract(tar, paths["root"])
-
-        dump_name = meta.get("db_dump") or ( "database.gz" if meta.get("format") == "liferay-cloud" else None )
-        if dump_name:
-            dump = choice / dump_name
-            if dump.exists():
-                jdbc = self.get_jdbc_params(paths["files"])
-                url, user, pw = jdbc.get("jdbc.default.url"), jdbc.get("jdbc.default.username"), jdbc.get("jdbc.default.password")
-                
-                if url and "postgresql" in url.lower():
-                    dbname = url.split("/")[-1].split("?")[0]
-                    host = self.args.pg_host or "localhost"
-                    port = self.args.pg_port or "5432"
-                    UI.info(f"Restoring PostgreSQL: {dbname}")
-                    env = os.environ.copy()
-                    env["DOCKER_CLI_HINTS"] = "false"
-                    if pw: env["PGPASSWORD"] = pw
-                    
-                    term_sql = f"SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '{dbname}' AND pid <> pg_backend_pid();"
-                    run_command(["psql", "-h", host, "-p", port, "-U", user, "-d", "postgres", "-c", term_sql], env=env, check=False)
-                    run_command(["psql", "-h", host, "-p", port, "-U", user, "-d", "postgres", "-c", f"DROP DATABASE IF EXISTS \"{dbname}\";"], env=env)
-                    run_command(["psql", "-h", host, "-p", port, "-U", user, "-d", "postgres", "-c", f"CREATE DATABASE \"{dbname}\" WITH TEMPLATE template0 ENCODING 'UTF8';"], env=env)
-                    
-                    with open(dump, "rb") as f_in:
-                        comp_cmd = ["gunzip", "-c"] if dump.name.endswith(".gz") else (["xz", "-dc"] if dump.name.endswith(".xz") else ["cat"])
-                        p1 = subprocess.Popen(comp_cmd, stdin=f_in, stdout=subprocess.PIPE)
-                        p2 = subprocess.Popen(["psql", "-h", host, "-p", port, "-U", user, "-d", dbname], env=env, stdin=p1.stdout)
-                        p2.communicate()
-                elif url and "mysql" in url.lower():
-                    dbname = url.split("/")[-1].split("?")[0]
-                    host = self.args.my_host or "localhost"
-                    port = self.args.my_port or "3306"
-                    UI.info(f"MySQL: {dbname}")
-                    pw_arg = f"-p{pw}" if pw else ""
-                    run_command(["mysql", "-h", host, "-P", port, "-u", user, pw_arg, "-e", f"DROP DATABASE IF EXISTS `{dbname}`; CREATE DATABASE `{dbname}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"])
-                    with open(dump, "rb") as f_in:
-                        comp_cmd = ["gunzip", "-c"] if dump.name.endswith(".gz") else (["xz", "-dc"] if dump.name.endswith(".xz") else ["cat"])
-                        p1 = subprocess.Popen(comp_cmd, stdin=f_in, stdout=subprocess.PIPE)
-                        p2 = subprocess.Popen(["mysql", "-h", host, "-P", port, "-u", user, pw_arg, dbname], stdin=p1.stdout)
-                        p2.communicate()
-
-        delete_bk = getattr(self.args, 'delete_after', False)
-        if not delete_bk and not self.non_interactive:
-            delete_bk = UI.ask("Delete snapshot after restore?", "N") == "Y"
-        if delete_bk:
-            UI.info(f"Cleaning up snapshot...")
-            self.safe_rmtree(choice, root=paths["backups"])
-
-        if is_running: run_command(["docker", "start", container_name])
+        with tarfile.open(choice / "files.tar.gz", "r:gz") as tar:
+            self.safe_extract(tar, paths["root"])
         UI.success("Restore complete.")
 
-
-
-# --- Main CLI ---
 def main():
-    parser = argparse.ArgumentParser(description="Liferay DXP Docker Manager (Python)")
-    parser.add_argument("--select", action="store_true", help="Browse and select managed DXP folders")
-    subparsers = parser.add_subparsers(dest="command", help="Command to run")
-
-    # Run command
-    run_parser = subparsers.add_parser("run", help="Run Liferay DXP container")
-    run_parser.add_argument("--select", action="store_true", help="Browse and select managed DXP folders")
-    run_parser.add_argument("-t", "--tag", help="Liferay Docker image tag")
-    run_parser.add_argument("-r", "--root", help="Project root path")
-    run_parser.add_argument("-c", "--container", help="Container name")
-    run_parser.add_argument("-f", "--follow", action="store_true", help="Follow logs after start")
-    run_parser.add_argument("--portal", action="store_true", help="Use Liferay Portal instead of DXP")
-    run_parser.add_argument("--release-type", choices=["any", "u", "lts", "qr"], help="Tag discovery mode")
-    run_parser.add_argument("--db", choices=["postgresql", "mysql", "hypersonic"], help="Database choice")
-    run_parser.add_argument("--jdbc-username", help="Username for external DB")
-    run_parser.add_argument("--jdbc-password", help="Password for external DB")
-    run_parser.add_argument("--recreate-db", action="store_true", help="Recreate DB if it exists")
-    run_parser.add_argument("-p", "--port", type=int, help="Local HTTP port")
-    run_parser.add_argument("--host-network", action="store_true", help="Use host networking")
-    run_parser.add_argument("--host-name", help="Virtual hostname for the instance")
-    run_parser.add_argument("--es-port", type=int, help="Elasticsearch sidecar HTTP port")
-    run_parser.add_argument("--disable-zip64", action="store_true", help="Disable JVM Zip64 validation")
-    run_parser.add_argument("--delete-state", action="store_true", help="Delete OSGi state before start")
-    run_parser.add_argument("--remove-after", action="store_true", help="Remove container after stop")
-    run_parser.add_argument("--refresh", action="store_true", help="Force refresh of Docker Hub tag cache")
-    run_parser.add_argument("--non-interactive", action="store_true")
-    run_parser.add_argument("--verbose", action="store_true")
-
-    # Snapshots command
-    subparsers.add_parser("snapshots", help="List available snapshots")
-
-    # Snapshot command
-    snap_parser = subparsers.add_parser("snapshot", help="Create a snapshot")
-    snap_parser.add_argument("-r", "--root", help="Project root path")
-    snap_parser.add_argument("-c", "--container", help="Container name")
-    snap_parser.add_argument("-n", "--name", help="Snapshot name")
-    snap_parser.add_argument("--prefix", help="Folder name prefix")
-    snap_parser.add_argument("--db-only", action="store_true")
-    snap_parser.add_argument("--files-only", action="store_true")
-    snap_parser.add_argument("--format", choices=["standard", "liferay-cloud"], help="Backup layout")
-    snap_parser.add_argument("--compression", choices=["gzip", "xz", "none"], help="Compression format")
-    snap_parser.add_argument("--retention", type=int, help="Number of backups to keep")
-    snap_parser.add_argument("--tag", action="append", help="Add custom tag (key=value)")
-    snap_parser.add_argument("--verify", action="store_true", help="Verify archive integrity")
-    snap_parser.add_argument("--no-stop", action="store_true", help="Do not stop container")
-    snap_parser.add_argument("--pg-host", help="PostgreSQL host override")
-    snap_parser.add_argument("--pg-port", help="PostgreSQL port override")
-    snap_parser.add_argument("--my-host", help="MySQL host override")
-    snap_parser.add_argument("--my-port", help="MySQL port override")
-    snap_parser.add_argument("--non-interactive", action="store_true")
-    snap_parser.add_argument("--verbose", action="store_true")
-
-    # Restore command
-    rest_parser = subparsers.add_parser("restore", help="Restore a snapshot")
-    rest_parser.add_argument("-r", "--root", help="Project root path")
-    rest_parser.add_argument("-c", "--container", help="Container name")
-    rest_parser.add_argument("-i", "--index", type=int, help="Backup index to restore")
-    rest_parser.add_argument("--checkpoint", help="Exact checkpoint folder name")
-    rest_parser.add_argument("--delete-state", action="store_true", help="Delete OSGi state before restore")
-    rest_parser.add_argument("--delete-es", action="store_true", help="Delete Elasticsearch data before restore")
-    rest_parser.add_argument("--delete-after", action="store_true", help="Delete snapshot after restore")
-    rest_parser.add_argument("--allow-legacy", action="store_true", help="Allow older meta_version")
-    rest_parser.add_argument("--pg-host", help="PostgreSQL host override")
-    rest_parser.add_argument("--pg-port", help="PostgreSQL port override")
-    rest_parser.add_argument("--my-host", help="MySQL host override")
-    rest_parser.add_argument("--my-port", help="MySQL_port override")
-    rest_parser.add_argument("--non-interactive", action="store_true")
-    rest_parser.add_argument("--verbose", action="store_true")
-
-    args = parser.parse_args()
+    parser = argparse.ArgumentParser(description="Liferay Docker Manager")
+    parser.add_argument("--select", action="store_true")
+    subparsers = parser.add_subparsers(dest="command")
     
-    if getattr(args, 'select', False) and not args.command:
-        args.command = "run"
+    run = subparsers.add_parser("run")
+    run.add_argument("-t", "--tag")
+    run.add_argument("-r", "--root")
+    run.add_argument("--host-name")
+    run.add_argument("--ssl", action="store_true", default=None)
+    run.add_argument("--no-ssl", action="store_false", dest="ssl")
+    run.add_argument("--port", type=int)
+    run.add_argument("--es-port", type=int)
+    run.add_argument("--refresh", action="store_true")
+    run.add_argument("--follow", action="store_true")
 
-    if not args.command:
+    subparsers.add_parser("snapshots")
+    snap = subparsers.add_parser("snapshot")
+    snap.add_argument("-n", "--name")
+    subparsers.add_parser("restore")
+    
+    args = parser.parse_args()
+    if not args.command: 
         parser.print_help()
         return
-
+    
     manager = LiferayManager(args)
     if args.command == "run": manager.cmd_run()
     elif args.command == "snapshots": manager.cmd_snapshots()
@@ -1409,6 +1093,4 @@ if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        print("\n")
-        UI.info("Interrupted by user. Exiting...")
         sys.exit(130)

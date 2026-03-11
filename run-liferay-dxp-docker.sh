@@ -48,6 +48,8 @@ PORT_ARG=""
 REMOVE_AFTER_FLAG=""
 KEEP_CONTAINER_FLAG=""
 DELETE_STATE_FLAG=""
+SSL_FLAG=""
+NO_SSL_FLAG=""
 FOLLOW_FLAG=0
 
 read_meta() {
@@ -182,6 +184,22 @@ with open(cache_file, 'w') as f: json.dump(cache, f)
   echo "$latest_tag"
 }
 
+setup_infrastructure() {
+  local ip="$1"; local port="$2"; local root="$3"
+  # 1. Silent Network Creation
+  docker network inspect liferay-net >/dev/null 2>&1 || docker network create liferay-net >/dev/null 2>&1
+
+  # 2. Singleton Proxy Check
+  if docker ps -q -f name=liferay-proxy-global | grep -q .; then
+    return 0
+  fi
+
+  info "Starting global Traefik SSL proxy..."
+  docker rm -f liferay-proxy-global >/dev/null 2>&1
+  docker pull traefik:v3.3 >/dev/null
+  docker run -d --rm --name liferay-proxy-global --network liferay-net -p "${ip}:${port}:443" -v "/var/run/docker.sock:/var/run/docker.sock:ro" -v "${root}/.certs:/etc/traefik/certs:ro" traefik:v3.3 --providers.docker=true --providers.docker.exposedbydefault=false --entrypoints.websecure.address=:443 --providers.file.directory=/etc/traefik/certs --providers.file.watch=true >/dev/null
+}
+
 normalize_jdbc() {
   local url="$1"
   [[ -z "$url" ]] && return
@@ -232,6 +250,8 @@ while [[ $# -gt 0 ]]; do
     --remove-after) REMOVE_AFTER_FLAG=1 ;;
     --keep-container) KEEP_CONTAINER_FLAG=1 ;;
     --delete-state) DELETE_STATE_FLAG=1 ;;
+    --ssl) SSL_FLAG=1 ;;
+    --no-ssl) NO_SSL_FLAG=1 ;;
     -f|--follow) FOLLOW_FLAG=1 ;;
     --quiet) QUIET=1 ;;
     --verbose) VERBOSE=1 ;;
@@ -334,57 +354,42 @@ else
   [[ -z "$REQUESTED_IP" ]] && REQUESTED_IP="127.0.0.1"
 fi
 
-RAW_JDBC=$(grep "^jdbc.default.url=" "$LIFERAY_ROOT/files/portal-ext.properties" 2>/dev/null | cut -d'=' -f2-)
-CURR_JDBC_NORM=$(normalize_jdbc "$RAW_JDBC")
-
-for d in */; do
-  d=${d%/}
-  [[ "$d" == "common" || "$d" == .* || "./$d" == "$LIFERAY_ROOT" ]] && continue
-  M_FILE="$d/$PROJECT_META_FILE"
-  [[ ! -f "$M_FILE" ]] && continue
-  
-  M_CONT=$(read_meta "$M_FILE" "container_name")
-  M_PORT=$(read_meta "$M_FILE" "port")
-  M_HOST=$(read_meta "$M_FILE" "host_name")
-  M_EP=$(read_meta "$M_FILE" "es_port")
-  M_JDBC_URL=$(read_meta "$M_FILE" "jdbc_url")
-  [[ -z "$M_JDBC_URL" ]] && M_JDBC_URL=$(grep "^jdbc.default.url=" "$d/files/portal-ext.properties" 2>/dev/null | cut -d'=' -f2-)
-  
-  M_IP=$(python3 -c "import socket; print(socket.gethostbyname('${M_HOST:-localhost}'))" 2>/dev/null)
-  [[ -z "$M_IP" ]] && M_IP="127.0.0.1"
-
-  # Collision check: Scan all meta files
-  if [[ -n "$CURR_JDBC_NORM" ]]; then
-    M_JDBC_NORM=$(normalize_jdbc "$M_JDBC_URL")
-    if [[ -n "$M_JDBC_NORM" && "$CURR_JDBC_NORM" == "$M_JDBC_NORM" ]]; then
-      error "Database collision! Project '$d' uses the same database:"
-      IFS='|' read -r drv host dbp dbn <<< "$CURR_JDBC_NORM"
-      echo -e " Database: $dbn on $host:$dbp ($drv)"
-      if [[ $NON_INTERACTIVE -eq 1 ]]; then exit 1; fi
-      read_config "Continue anyway?" CONT_DB N; [[ "${CONT_DB:u}" != "Y" ]] && exit 1
-    fi
-  fi
-
-  if docker ps --filter "name=^${M_CONT}$" --format "{{.Names}}" | grep -q "^${M_CONT}$"; then
-    if [[ "$REQUESTED_PORT" == "$M_PORT" && "$REQUESTED_IP" == "$M_IP" ]]; then
-      error "Port $REQUESTED_PORT on $REQUESTED_IP is already in use by running container '$M_CONT'"
-      if [[ $NON_INTERACTIVE -eq 1 ]]; then exit 1; fi
-      read_config "Enter a different Local Port" REQUESTED_PORT $(($REQUESTED_PORT + 1))
-    fi
-    if [[ "$REQUESTED_HOSTNAME" != "localhost" && "$REQUESTED_HOSTNAME" == "$M_HOST" ]]; then
-      error "Hostname '$REQUESTED_HOSTNAME' is already in use by running container '$M_CONT'"
-      if [[ $NON_INTERACTIVE -eq 1 ]]; exit 1; fi
-      read_config "Enter a different Hostname" REQUESTED_HOSTNAME "alt-$REQUESTED_HOSTNAME"
-      REQUESTED_IP=$(python3 -c "import socket; print(socket.gethostbyname('$REQUESTED_HOSTNAME'))" 2>/dev/null)
-      [[ -z "$REQUESTED_IP" ]] && REQUESTED_IP="127.0.0.1"
-    fi
-  fi
-done
-
 LOCAL_PORT=$REQUESTED_PORT
 HOST_NAME=$REQUESTED_HOSTNAME
 ES_PORT=$REQUESTED_ES_PORT
 RESOLVED_IP=$REQUESTED_IP
+
+# SSL Pre-flight
+USE_SSL=0
+if [[ -n "$SSL_FLAG" ]]; then USE_SSL=1; elif [[ -n "$NO_SSL_FLAG" ]]; then USE_SSL=0; else
+  if [[ "$HOST_NAME" != "localhost" && -n "$HOST_NAME" ]]; then USE_SSL=1; fi; fi
+
+SSL_PORT=443
+if [[ $USE_SSL -eq 1 ]]; then
+  if [[ "$USE_HOST_NETWORK" == "True" ]]; then
+    _die "SSL with Traefik is not supported in --host-network mode."
+  fi
+  
+  if ! check_port_available 443 "$RESOLVED_IP"; then
+    if ! docker ps -q -f name=liferay-proxy-global | grep -q .; then
+      error "Host port 443 is blocked on $RESOLVED_IP."
+      info "HINT: To use the standard HTTPS port, run this script with sudo."
+      if [[ $NON_INTERACTIVE -eq 0 ]]; then
+        read_config "Would you like to continue using port 8443 instead?" CONT_8443 Y
+        if [[ "${CONT_8443:u}" == "Y" ]]; then
+          if ! check_port_available 8443 "$RESOLVED_IP"; then
+            _die "Host port 8443 is also in use on $RESOLVED_IP. Aborting SSL setup."
+          fi
+          SSL_PORT=8443
+        else
+          exit 0
+        fi
+      else
+        _die "Port 443 unavailable in non-interactive mode. Aborting."
+      fi
+    fi
+  fi
+fi
 
 if [[ "$HOST_NAME" != "localhost" ]]; then
   info "Verifying resolution for '$HOST_NAME'..."
@@ -403,6 +408,42 @@ if [[ "$HOST_NAME" != "localhost" ]]; then
     fi
   fi
 fi
+
+# Collision Scan & Port Auto-Increment
+PORT_ASSIGNED=0
+while [[ $PORT_ASSIGNED -eq 0 ]]; do
+  COLLISION_FOUND=0
+  for d in */; do
+    d=${d%/}
+    [[ "$d" == "common" || "$d" == .* || "./$d" == "$LIFERAY_ROOT" ]] && continue
+    M_FILE="$d/$PROJECT_META_FILE"
+    [[ ! -f "$M_FILE" ]] && continue
+    
+    M_CONT=$(read_meta "$M_FILE" "container_name")
+    M_PORT=$(read_meta "$M_FILE" "port")
+    M_HOST=$(read_meta "$M_FILE" "host_name")
+    
+    M_IP=$(python3 -c "import socket; print(socket.gethostbyname('${M_HOST:-localhost}'))" 2>/dev/null)
+    [[ -z "$M_IP" ]] && M_IP="127.0.0.1"
+
+    # Port Conflict Check
+    if docker ps --filter "name=^${M_CONT}$" --format "{{.Names}}" | grep -q "^${M_CONT}$"; then
+      if [[ "$LOCAL_PORT" == "$M_PORT" && "$RESOLVED_IP" == "$M_IP" ]]; then
+        LOCAL_PORT=$(($LOCAL_PORT + 1))
+        COLLISION_FOUND=1
+        break
+      fi
+    fi
+  done
+  
+  if [[ $COLLISION_FOUND -eq 0 ]]; then
+    if ! check_port_available "$LOCAL_PORT" "$RESOLVED_IP"; then
+      LOCAL_PORT=$(($LOCAL_PORT + 1))
+      continue
+    fi
+    PORT_ASSIGNED=1
+  fi
+done
 
 if [[ -n "$TAG_ARG" ]]; then
   LIFERAY_TAG="$TAG_ARG"
@@ -450,10 +491,15 @@ else
   FORCE_INIT=1
 fi
 
-if [[ $FORCE_INIT -eq 1 ]]; then
-  info_custom "${BYELLOW}=== Initializing $CONTAINER_NAME ==="
+  if [[ $FORCE_INIT -eq 1 ]]; then
+    info_custom "${BYELLOW}=== Initializing $CONTAINER_NAME ==="
 
-  [[ -n "$REMOVE_AFTER_FLAG" ]] && REMOVE_CONTAINER=Y || { [[ -n "$KEEP_CONTAINER_FLAG" ]] && REMOVE_CONTAINER=N || read_config "Remove container afterwards" REMOVE_CONTAINER Y; }
+    # Smart 'Remove' Logic
+    REMOVE_CONTAINER=N
+    [[ -n "$REMOVE_AFTER_FLAG" ]] && REMOVE_CONTAINER=Y
+    if [[ "$REMOVE_CONTAINER" == "N" && $FOLLOW_FLAG -eq 1 && $NON_INTERACTIVE -eq 0 ]]; then
+      read_config "Remove container afterwards" REM_C N; [[ "${REM_C:u}" == "Y" ]] && REMOVE_CONTAINER=Y
+    fi
   
   if [[ -n "$DB_KIND" ]]; then LIFERAY_DATABASE="$DB_KIND"; else
     LIFERAY_DATABASE=${META_DB:-"hypersonic"}
@@ -486,10 +532,32 @@ if [[ $FORCE_INIT -eq 1 ]]; then
   fi
 
   [[ -n "$HOST_NETWORK_FLAG" ]] && USE_HOST_NETWORK=True || { [[ -n "$NO_HOST_NETWORK_FLAG" ]] && USE_HOST_NETWORK=False || { USE_HOST_NETWORK=${META_HOSTNET:-"False"}; [[ "$USE_HOST_NETWORK" == "False" && $NON_INTERACTIVE -eq 0 ]] && { read_config "Use host network" UNET N; [[ "${UNET:u}" == "Y" ]] && USE_HOST_NETWORK=True; }; }; }
-  if [[ "$USE_HOST_NETWORK" == "True" ]]; then NETWORK_ARGS="--network=host"; else 
-    ! check_port_available "$LOCAL_PORT" "$RESOLVED_IP" && _die "Port $LOCAL_PORT already in use on $RESOLVED_IP"
-    ! check_port_available "$ES_PORT" "$RESOLVED_IP" && _die "Port $ES_PORT already in use on $RESOLVED_IP"
-    NETWORK_ARGS="-p ${RESOLVED_IP}:${LOCAL_PORT}:8080 -p ${RESOLVED_IP}:${ES_PORT}:9200"; fi
+  
+  # Network & Traefik Labels
+  TRAEFIK_LABELS=()
+  NETWORK_ARGS="-p ${RESOLVED_IP}:${LOCAL_PORT}:8080"
+  if [[ $USE_SSL -eq 1 ]]; then
+    TRAEFIK_LABELS=(
+      "--label" "traefik.enable=true"
+      "--label" "traefik.http.routers.${CONTAINER_NAME}.rule=Host(\`${HOST_NAME}\`)"
+      "--label" "traefik.http.routers.${CONTAINER_NAME}.entrypoints=websecure"
+      "--label" "traefik.http.routers.${CONTAINER_NAME}.tls=true"
+      "--label" "traefik.http.services.${CONTAINER_NAME}.loadbalancer.server.port=8080"
+      "--label" "traefik.docker.network=liferay-net"
+    )
+    # Use shared bridge for SSL
+    NETWORK_ARGS="--network=liferay-net $NETWORK_ARGS"
+  elif [[ "$USE_HOST_NETWORK" == "True" ]]; then
+    NETWORK_ARGS="--network=host"
+  fi
+
+  # ES Port logic: Skip prompt and handle busy port gracefully
+  ES_PORT=${ES_PORT_ARG:-${META_ES_PORT:-9200}}
+  if check_port_available "$ES_PORT" "$RESOLVED_IP"; then
+    NETWORK_ARGS="$NETWORK_ARGS -p ${RESOLVED_IP}:${ES_PORT}:9200"
+  else
+    info "Note: Host port $ES_PORT is busy. ES sidecar is active internally but not exposed."
+  fi
 
   JVM_OPTS=""; [[ -n "$DISABLE_ZIP64_FLAG_EXPL" ]] && JVM_OPTS="-Djdk.util.zip.disableZip64ExtraFieldValidation=true"
   if [[ "$HOST_NAME" != "localhost" ]]; then
@@ -498,8 +566,24 @@ if [[ $FORCE_INIT -eq 1 ]]; then
   fi
   [[ "$ES_PORT" != "9200" ]] && update_portal_ext "${FILES_VOLUME}/portal-ext.properties" "module.framework.properties.com.liferay.portal.search.elasticsearch7.configuration.ElasticsearchConfiguration.sidecarHttpPort" "$ES_PORT" "module.framework.properties.com.liferay.portal.search.elasticsearch7.configuration.ElasticsearchConfiguration.transportTcpPort" "$(($ES_PORT + 100))"
   
+  # SSL Setup
+  if [[ $USE_SSL -eq 1 ]]; then
+    if ! command -v mkcert &> /dev/null; then
+      error "mkcert is not installed. SSL support will be skipped."; USE_SSL=0
+    else
+      CERT_DIR="$LIFERAY_ROOT/.certs"
+      mkdir -p "$CERT_DIR"
+      if [[ ! -f "$CERT_DIR/$HOST_NAME.pem" ]]; then
+        info "Generating SSL certificate for $HOST_NAME..."
+        mkcert -cert-file "$CERT_DIR/$HOST_NAME.pem" -key-file "$CERT_DIR/$HOST_NAME-key.pem" "$HOST_NAME" >/dev/null 2>&1
+      fi
+      echo -e "tls:\n  certificates:\n    - certFile: /etc/traefik/certs/$HOST_NAME.pem\n      keyFile: /etc/traefik/certs/$HOST_NAME-key.pem" > "$CERT_DIR/traefik-dynamic.yml"
+      setup_infrastructure "$RESOLVED_IP" "$SSL_PORT" "$LIFERAY_ROOT"
+    fi
+  fi
+
   L_TAG="$IMAGE_NAME:$LIFERAY_TAG"; docker pull "$L_TAG"
-  docker create -it ${NETWORK_ARGS} --name "${CONTAINER_NAME}" ${JVM_OPTS:+"-e LIFERAY_JVM_OPTS=$JVM_OPTS"} -v "${FILES_VOLUME}:/mnt/liferay/files" -v "$LIFERAY_ROOT/scripts:/mnt/liferay/scripts" -v "${STATE_VOLUME}:/opt/liferay/osgi/state" -v "$LIFERAY_ROOT/osgi/modules:/opt/liferay/modules" -v "$LIFERAY_ROOT/data:/opt/liferay/data" -v "$LIFERAY_ROOT/deploy:/mnt/liferay/deploy" -v "$LIFERAY_ROOT/osgi/client-extensions:/opt/liferay/osgi/client-extensions" "$L_TAG"
+  docker create -it ${NETWORK_ARGS} --name "${CONTAINER_NAME}" ${JVM_OPTS:+"-e LIFERAY_JVM_OPTS=$JVM_OPTS"} "${TRAEFIK_LABELS[@]}" -v "${FILES_VOLUME}:/mnt/liferay/files" -v "$LIFERAY_ROOT/scripts:/mnt/liferay/scripts" -v "${STATE_VOLUME}:/opt/liferay/osgi/state" -v "$LIFERAY_ROOT/osgi/modules:/opt/liferay/modules" -v "$LIFERAY_ROOT/data:/opt/liferay/data" -v "$LIFERAY_ROOT/deploy:/mnt/liferay/deploy" -v "$LIFERAY_ROOT/osgi/client-extensions:/opt/liferay/osgi/client-extensions" "$L_TAG"
 else
   info_custom "${BYELLOW}=== Resuming $CONTAINER_NAME ==="
   [[ -n "$REMOVE_AFTER_FLAG" ]] && REMOVE_CONTAINER=Y || read_config "Remove container afterwards" REMOVE_CONTAINER N
@@ -527,15 +611,32 @@ else
       info "Clearing OSGi state..."; rm -rf "$STATE_VOLUME" 2>/dev/null; mkdir -p "$STATE_VOLUME"
     fi
   fi
+  # Re-detect USE_SSL for success message on resume
+  USE_SSL=0; [[ "$(read_meta "$LIFERAY_ROOT/$PROJECT_META_FILE" "ssl")" == "1" ]] && USE_SSL=1
 fi
 
 CURRENT_JDBC_URL=$(grep "^jdbc.default.url=" "$FILES_VOLUME/portal-ext.properties" 2>/dev/null | cut -d'=' -f2-)
-write_meta "$LIFERAY_ROOT/$PROJECT_META_FILE" "tag" "$LIFERAY_TAG" "port" "$LOCAL_PORT" "db_type" "$LIFERAY_DATABASE" "container_name" "$CONTAINER_NAME" "host_network" "$USE_HOST_NETWORK" "host_name" "$HOST_NAME" "es_port" "$ES_PORT" "jdbc_url" "$CURRENT_JDBC_URL" "last_run" "$(date -Iseconds)"
+write_meta "$LIFERAY_ROOT/$PROJECT_META_FILE" "tag" "$LIFERAY_TAG" "port" "$LOCAL_PORT" "db_type" "$LIFERAY_DATABASE" "container_name" "$CONTAINER_NAME" "host_network" "$USE_HOST_NETWORK" "host_name" "$HOST_NAME" "es_port" "$ES_PORT" "jdbc_url" "$CURRENT_JDBC_URL" "ssl" "$USE_SSL" "last_run" "$(date -Iseconds)"
 
 if [[ $FOLLOW_FLAG -eq 1 ]]; then
   docker start -i -a "${CONTAINER_NAME}" || { [[ "$(docker inspect -f '{{.State.ExitCode}}' $CONTAINER_NAME)" == "130" ]] || exit $?; }
 else
   info "Starting ${CONTAINER_NAME}..."; docker start "${CONTAINER_NAME}" >/dev/null || exit $?
-  info "Container started.\n  Logs: ${Cyan}docker logs -f ${CONTAINER_NAME}${Color_Off}\n  URL:  ${Cyan}http://${HOST_NAME:-localhost}:${LOCAL_PORT:-8080}${Color_Off}\n  Stop: ${Cyan}docker rm -f ${CONTAINER_NAME}${Color_Off}"
+  PROTO="http"; ACCESS_PORT=":$LOCAL_PORT"; 
+  if [[ $USE_SSL -eq 1 ]]; then
+    PROTO="https"; 
+    if [[ "$SSL_PORT" == "443" ]]; then ACCESS_PORT=""; else ACCESS_PORT=":$SSL_PORT"; fi
+  fi
+  access_url="${PROTO}://${HOST_NAME:-localhost}${ACCESS_PORT}"
+  info_custom "${Green}✅ Container ${CONTAINER_NAME} is up and running!"
+  info_custom "  ${White}🌐 URL:            ${Cyan}${access_url}"
+  info_custom "  ${White}📄 Logs:           ${Cyan}docker logs -f ${CONTAINER_NAME}"
+  
+  CLEANUP_MAIN="docker rm -f ${CONTAINER_NAME}"
+  info_custom "  ${White}🛑 To stop and delete this demo: ${Cyan}${CLEANUP_MAIN}"
+  [[ $USE_SSL -eq 1 ]] && info_custom "  ${White}🛑 To stop everything (including proxy): ${Cyan}${CLEANUP_MAIN} liferay-proxy-global"
+  
+  echo -e "\n${White}Notice a bug or have a feature request? Please report it on GitHub at:"
+  echo -e "${Cyan}https://github.com/peterrichards-lr/liferay-docker-scripts${Color_Off}"
 fi
 [[ "${REMOVE_CONTAINER:u}" == "Y" ]] && { info "Deleting $CONTAINER_NAME"; docker rm --force "$CONTAINER_NAME" >/dev/null 2>&1; }
