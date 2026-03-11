@@ -45,7 +45,7 @@ Launch a Liferay DXP instance on the default port (8080) with Hypersonic:
 ```bash
 ./liferay-docker.sh run --tag 2025.q4.11
 ```
-*Note: The container starts in the background. Use `--follow` to attach to the logs.*
+*Note: The container starts in the background. The script will provide direct `docker logs -f <name>`, access URL, and `docker rm -f <name>` commands upon successful startup.*
 
 ### 2. Run a Liferay Portal Instance
 Use the `--portal` flag to switch to the open-source Liferay Portal image:
@@ -75,6 +75,7 @@ Use unique virtual hostnames and loopback IPs to run instances side-by-side on t
 # Restore the latest snapshot
 ./liferay-docker.sh restore
 ```
+*Note: Snapshot and restore commands use **Smart Root detection**. If run outside a Liferay project, they will automatically scan subdirectories and offer an interactive selection of managed folders.*
 
 ---
 

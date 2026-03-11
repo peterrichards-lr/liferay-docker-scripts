@@ -4,6 +4,7 @@ set -o pipefail
 SCRIPT_VERSION="2025-11-12"
 META_VERSION="2"
 
+export DOCKER_CLI_HINTS=false
 Color_Off='\033[0m'
 Green='\033[0;32m'
 Yellow='\033[0;33m'
@@ -321,6 +322,14 @@ if [[ $FILES_ONLY -eq 0 ]]; then
     pghost="${PG_HOST_OVERRIDE:-localhost}"
     pgport="${PG_PORT_OVERRIDE:-5432}"
     [[ "$pghost" == "host.docker.internal" ]] && pghost="localhost"
+
+    # Pre-flight Check: Verify connectivity and credentials
+    info "Verifying PostgreSQL connectivity & auth ($pghost:$pgport)..."
+    PGPASSWORD="$jdbc_pass" psql -h "$pghost" -p "$pgport" -U "$jdbc_user" -d postgres -c "SELECT 1" >/dev/null 2>&1
+    if [[ $? -ne 0 ]]; then
+      _die "PostgreSQL database is not reachable or authentication failed on $pghost:$pgport."
+    fi
+
     if [[ "$BACKUP_FORMAT" == "liferay-cloud" ]]; then
       dump_file="$checkpoint_dir/database.gz"; dump_cmd="pg_dump -h $pghost -p $pgport -U $jdbc_user -d $dbname -F p --no-owner --no-privileges | gzip -c"
     else
@@ -335,6 +344,14 @@ if [[ $FILES_ONLY -eq 0 ]]; then
     myhost="${MY_HOST_OVERRIDE:-localhost}"
     myport="${MY_PORT_OVERRIDE:-3306}"
     [[ "$myhost" == "host.docker.internal" ]] && myhost="localhost"
+
+    # Pre-flight Check: Verify connectivity and credentials
+    info "Verifying MySQL connectivity & auth ($myhost:$myport)..."
+    mysql -h "$myhost" -P "$myport" -u "$jdbc_user" -p"$jdbc_pass" -e "SELECT 1" >/dev/null 2>&1
+    if [[ $? -ne 0 ]]; then
+      _die "MySQL database is not reachable or authentication failed on $myhost:$myport."
+    fi
+
     if [[ "$BACKUP_FORMAT" == "liferay-cloud" ]]; then
       dump_file="$checkpoint_dir/database.gz"; dump_cmd="mysqldump -h $myhost -P $myport -u $jdbc_user -p$jdbc_pass --databases $dbname | gzip -c"
     else

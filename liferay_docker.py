@@ -79,6 +79,14 @@ class UI:
 
 # --- Utilities ---
 def run_command(cmd, shell=False, capture_output=True, check=True, env=None):
+    if env is None:
+        env = os.environ.copy()
+    else:
+        env = env.copy()
+    
+    # Suppress Docker CLI "What's next" hints and non-essential messages
+    env["DOCKER_CLI_HINTS"] = "false"
+    
     try:
         result = subprocess.run(
             cmd, shell=shell, capture_output=capture_output, text=True, check=check, env=env
@@ -519,16 +527,18 @@ class LiferayManager:
         if root_path and Path(root_path).exists():
             project_meta = self.read_meta(Path(root_path) / PROJECT_META_FILE)
 
-        # Early Conflict & Hostname Check
+        # --- PRE-FLIGHT / FAST-FAIL CHECKS ---
         port = self.args.port or project_meta.get("port")
         host_name = self.args.host_name or project_meta.get("host_name")
         es_port = self.args.es_port or project_meta.get("es_port")
         container_name = self.args.container or project_meta.get("container_name") or (Path(root_path).name.replace(".", "-") if root_path else None)
         db_kind = getattr(self.args, 'db', None) or project_meta.get("db_type")
 
+        # 1. Hostname/Bindability Validation (Resolves IP)
         if host_name and not self.check_hostname(host_name):
             sys.exit(1)
 
+        # 2. Collision Scan (Ports and DB)
         if not self.non_interactive or self.args.port or self.args.host_name or self.args.es_port:
             search_dir = Path(root_path).parent if root_path else Path.cwd()
             other_projects = self.find_dxp_roots(search_dir)
@@ -553,8 +563,7 @@ class LiferayManager:
                 
                 meta = self.read_meta(proj["path"] / PROJECT_META_FILE)
 
-                # Database collision check (scan all projects, running or not)
-                # Check meta file first, then fallback to properties
+                # DB Collision Check
                 proj_jdbc_url = meta.get("jdbc_url")
                 if not proj_jdbc_url:
                     proj_jdbc_params = self.get_jdbc_params(proj["path"] / "files")
@@ -573,7 +582,7 @@ class LiferayManager:
                     if self.non_interactive: sys.exit(1)
                     if UI.ask("Continue anyway?", "N").upper() != "Y": sys.exit(1)
 
-                # Check if project is likely running (container exists)
+                # Port/Hostname Conflict Check (Running containers)
                 check_cmd = ["docker", "ps", "--filter", f"name=^{meta.get('container_name')}$", "--format", "{{.Names}}"]
                 if run_command(check_cmd, check=False):
                     m_ip = self.get_resolved_ip(meta.get("host_name")) or "127.0.0.1"
@@ -593,6 +602,8 @@ class LiferayManager:
                         UI.error(f"Elasticsearch port {es_port} on {r_ip} is already in use by running container '{meta.get('container_name')}'")
                         if self.non_interactive: sys.exit(1)
                         es_port = int(UI.ask("Enter a different Elasticsearch Port", int(es_port) + 1))
+
+        # --- END PRE-FLIGHT CHECKS ---
 
         tag = self.args.tag or project_meta.get("tag")
         use_portal = self.args.portal or (project_meta.get("image_type") == "portal")
@@ -629,6 +640,14 @@ class LiferayManager:
         
         inspect = run_command(["docker", "ps", "-a", "--filter", f"name=^{container_name}$", "--format", "{{.Names}}"], check=False)
         
+        force_init = False
+        if inspect and container_name in inspect.split("\n"):
+            if not self.non_interactive:
+                if UI.ask(f"Container '{container_name}' already exists. Would you like to remove it and re-initialize?", "N").upper() == "Y":
+                    UI.info(f"Removing existing container {container_name}...")
+                    run_command(["docker", "rm", "-f", container_name])
+                    force_init = True
+
         db_kind = getattr(self.args, 'db', None) or project_meta.get("db_type")
         use_host_net = getattr(self.args, 'host_network', None)
         if use_host_net is None:
@@ -639,7 +658,7 @@ class LiferayManager:
 
         resolved_ip = self.get_resolved_ip(host_name) or "127.0.0.1"
 
-        if not inspect or container_name not in inspect.split("\n"):
+        if force_init or not inspect or container_name not in inspect.split("\n"):
             UI.heading(f"Initializing {container_name}")
             
             for p in paths.values():
@@ -806,13 +825,27 @@ class LiferayManager:
                 is_running = run_command(["docker", "ps", "-q", "-f", f"name={container_name}"])
                 if is_running:
                     UI.info(f"Stopping {container_name} to clear state...")
-                    run_command(["docker", "stop", container_name])
-                    if not self.wait_for_container_stop(container_name):
-                        UI.die(f"Container {container_name} failed to stop within timeout. Aborting state deletion.")
+                    try:
+                        run_command(["docker", "stop", container_name], check=True)
+                    except subprocess.CalledProcessError as e:
+                        UI.error(f"Failed to stop container: {e.stderr.decode().strip()}")
+                        UI.error("Aborting OSGi state deletion to prevent volume corruption.")
+                        delete_state = False
+                    
+                    if delete_state:
+                        UI.info("Waiting for container to release volumes...")
+                        if not self.wait_for_container_stop(container_name):
+                            UI.error(f"Container {container_name} failed to stop within timeout.")
+                            UI.error("Aborting OSGi state deletion to prevent volume corruption.")
+                            delete_state = False
+                        else:
+                            # Safety sleep for host-side volume release
+                            time.sleep(2)
 
-                UI.info("Clearing OSGi state...")
-                if self.safe_rmtree(paths["state"], root=paths["root"]):
-                    paths["state"].mkdir(parents=True)
+                if delete_state:
+                    UI.info("Clearing OSGi state...")
+                    if self.safe_rmtree(paths["state"], root=paths["root"]):
+                        paths["state"].mkdir(parents=True)
 
         # Capture current JDBC URL for collision checks
         jdbc_params = self.get_jdbc_params(paths["files"])
@@ -851,7 +884,8 @@ class LiferayManager:
                 access_url = f"http://{host_name or 'localhost'}:{port or 8080}"
                 UI.success(f"Container {container_name} started.\n"
                            f"  Logs: {UI.CYAN}docker logs -f {container_name}{UI.COLOR_OFF}\n"
-                           f"  URL:  {UI.CYAN}{access_url}{UI.COLOR_OFF}")
+                           f"  URL:  {UI.CYAN}{access_url}{UI.COLOR_OFF}\n"
+                           f"  Stop: {UI.CYAN}docker rm -f {container_name}{UI.COLOR_OFF}")
         except (subprocess.CalledProcessError, KeyboardInterrupt) as e:
             if isinstance(e, subprocess.CalledProcessError):
                 if "can't assign requested address" in str(e.stderr or "") or "bind: can't assign requested address" in (e.stdout or ""):
@@ -926,7 +960,41 @@ class LiferayManager:
         container_name = self.args.container or project_meta.get("container_name")
         if not container_name:
             container_name = Path(root_path).name.replace(".", "-")
+
+        # --- PRE-FLIGHT CONNECTIVITY CHECK ---
+        jdbc = self.get_jdbc_params(paths["files"])
+        url = jdbc.get("jdbc.default.url")
         
+        if url and not getattr(self.args, 'files_only', False):
+            user = jdbc.get("jdbc.default.username", "")
+            pw = jdbc.get("jdbc.default.password", "")
+            
+            if "postgresql" in url.lower():
+                host = self.args.pg_host or "localhost"
+                port = self.args.pg_port or "5432"
+                UI.info(f"Verifying PostgreSQL connectivity & auth ({host}:{port})...")
+                
+                env = os.environ.copy()
+                env["DOCKER_CLI_HINTS"] = "false"
+                if pw: env["PGPASSWORD"] = pw
+                
+                # Perform a dummy query to verify credentials and reachability
+                check_res = run_command(["psql", "-h", host, "-p", port, "-U", user, "-d", "postgres", "-c", "SELECT 1"], check=False, env=env)
+                if check_res is None:
+                    UI.die(f"PostgreSQL database is not reachable or authentication failed on {host}:{port}. Aborting snapshot.")
+            
+            elif "mysql" in url.lower():
+                host = self.args.my_host or "localhost"
+                port = self.args.my_port or "3306"
+                UI.info(f"Verifying MySQL connectivity & auth ({host}:{port})...")
+                
+                pw_arg = f"-p{pw}" if pw else ""
+                # Perform a dummy query to verify credentials and reachability
+                check_res = run_command(["mysql", "-h", host, "-P", port, "-u", user, pw_arg, "-e", "SELECT 1"], check=False)
+                if check_res is None:
+                    UI.die(f"MySQL database is not reachable or authentication failed on {host}:{port}. Aborting snapshot.")
+
+        # --- CONTINUE TO INTERACTIVE FLOW ---
         is_running = run_command(["docker", "ps", "-q", "-f", f"name={container_name}"])
         stop_needed = (not getattr(self.args, 'no_stop', False) and is_running)
         
@@ -935,9 +1003,15 @@ class LiferayManager:
 
         if stop_needed and is_running:
             UI.info(f"Stopping {container_name}...")
-            run_command(["docker", "stop", container_name])
+            try:
+                run_command(["docker", "stop", container_name], check=True)
+            except subprocess.CalledProcessError as e:
+                UI.die(f"Failed to stop container: {e.stderr.decode().strip()}")
+            
+            UI.info("Waiting for container to release volumes...")
             if not self.wait_for_container_stop(container_name):
                 UI.die(f"Container {container_name} failed to stop within timeout. Aborting snapshot.")
+            time.sleep(2)
 
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         prefix = self.args.prefix + "-" if self.args.prefix else ""
@@ -1026,6 +1100,7 @@ class LiferayManager:
                 port = self.args.pg_port or "5432"
                 UI.info(f"PostgreSQL: {dbname}")
                 env = os.environ.copy()
+                env["DOCKER_CLI_HINTS"] = "false"
                 if pw: env["PGPASSWORD"] = pw
                 
                 dump_cmd = ["pg_dump", "-h", host, "-p", port, "-U", user, dbname]
@@ -1142,7 +1217,7 @@ class LiferayManager:
         if stop_needed and is_running:
             UI.info(f"Stopping {container_name}...")
             try:
-                subprocess.run(["docker", "stop", container_name], check=True, capture_output=True)
+                run_command(["docker", "stop", container_name], check=True)
             except subprocess.CalledProcessError as e:
                 UI.die(f"Failed to stop container: {e.stderr.decode().strip()}")
             
@@ -1206,6 +1281,7 @@ class LiferayManager:
                     port = self.args.pg_port or "5432"
                     UI.info(f"Restoring PostgreSQL: {dbname}")
                     env = os.environ.copy()
+                    env["DOCKER_CLI_HINTS"] = "false"
                     if pw: env["PGPASSWORD"] = pw
                     
                     term_sql = f"SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '{dbname}' AND pid <> pg_backend_pid();"
