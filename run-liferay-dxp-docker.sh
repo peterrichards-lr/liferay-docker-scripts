@@ -187,9 +187,26 @@ with open(cache_file, 'w') as f: json.dump(cache, f)
 setup_infrastructure() {
   local ip="$1"; local port="$2"; local root="$3"
   # 1. Silent Network Creation
-  docker network inspect liferay-net >/dev/null 2>&1 || docker network create liferay-net >/dev/null 2>&1
+  docker network inspect liferay-proxy-net >/dev/null 2>&1 || docker network create liferay-proxy-net >/dev/null 2>&1
 
-  # 2. Singleton Proxy Check
+  # 2. macOS Socat Bridge (Cross-platform reliability fix)
+  local DOCKER_ENDPOINT="unix:///var/run/docker.sock"
+  local SOCKET_MOUNT="-v /var/run/docker.sock:/var/run/docker.sock:ro"
+  
+  if [[ "$(uname)" == "Darwin" ]]; then
+    if ! docker ps -q -f name=docker-socket-proxy | grep -q .; then
+      local REAL_HOME=$(eval echo "~${SUDO_USER:-$USER}")
+      local docker_sock="$REAL_HOME/.docker/run/docker.sock"
+      [[ ! -S "$docker_sock" ]] && docker_sock="/var/run/docker.sock"
+      
+      info "Starting macOS Docker socket bridge (socat)..."
+      docker run -d --rm --name docker-socket-proxy --network liferay-proxy-net -v "$HOME/.liferay_docker_certs:/etc/traefik/certs:ro" -v "$docker_sock:/var/run/docker.sock:ro" alpine/socat TCP-LISTEN:2375,fork,reuseaddr UNIX-CONNECT:/var/run/docker.sock >/dev/null 2>&1
+    fi
+    DOCKER_ENDPOINT="tcp://docker-socket-proxy:2375"
+    SOCKET_MOUNT="" # macOS uses TCP bridge, no direct mount needed for Traefik
+  fi
+
+  # 3. Singleton Proxy Check
   if docker ps -q -f name=liferay-proxy-global | grep -q .; then
     return 0
   fi
@@ -197,7 +214,7 @@ setup_infrastructure() {
   info "Starting global Traefik SSL proxy..."
   docker rm -f liferay-proxy-global >/dev/null 2>&1
   docker pull traefik:v3.3 >/dev/null
-  docker run -d --rm --name liferay-proxy-global --network liferay-net -p "${ip}:${port}:443" -v "/var/run/docker.sock:/var/run/docker.sock:ro" -v "${root}/.certs:/etc/traefik/certs:ro" traefik:v3.3 --providers.docker=true --providers.docker.exposedbydefault=false --entrypoints.websecure.address=:443 --providers.file.directory=/etc/traefik/certs --providers.file.watch=true >/dev/null
+  docker run -d --rm --name liferay-proxy-global --network liferay-proxy-net -e DOCKER_API_VERSION=1.44 -p "${ip}:${port}:443" ${SOCKET_MOUNT} -v "${root}/.certs:/etc/traefik/certs:ro" traefik:v3.3 --providers.docker=true --providers.docker.endpoint="$DOCKER_ENDPOINT" --providers.docker.exposedbydefault=false --entrypoints.websecure.address=:443 --providers.file.directory=/etc/traefik/certs --providers.file.watch=true >/dev/null
 }
 
 normalize_jdbc() {
@@ -466,6 +483,8 @@ fi
 
 [[ -z "$LIFERAY_ROOT" ]] && { [[ $NON_INTERACTIVE -eq 1 ]] && LIFERAY_ROOT="./$LIFERAY_TAG" || read_config "Liferay Root" LIFERAY_ROOT "./$LIFERAY_TAG"; }
 [[ ! "$LIFERAY_ROOT" =~ ^(\.\/|\/).+$ ]] && LIFERAY_ROOT=./$LIFERAY_ROOT
+# Normalize path to absolute
+LIFERAY_ROOT=$(cd "$LIFERAY_ROOT" 2>/dev/null && pwd || echo "$LIFERAY_ROOT")
 CONTAINER_NAME=${CONTAINER_ARG:-${META_CONTAINER:-$(echo "$LIFERAY_ROOT" | sed -e 's:.*/::' -e 's/[\.]/-/g')}}
 
 if [[ ! -d "$LIFERAY_ROOT" ]]; then
@@ -543,10 +562,10 @@ fi
       "--label" "traefik.http.routers.${CONTAINER_NAME}.entrypoints=websecure"
       "--label" "traefik.http.routers.${CONTAINER_NAME}.tls=true"
       "--label" "traefik.http.services.${CONTAINER_NAME}.loadbalancer.server.port=8080"
-      "--label" "traefik.docker.network=liferay-net"
+      "--label" "traefik.docker.network=liferay-proxy-net"
     )
     # Use shared bridge for SSL
-    NETWORK_ARGS="--network=liferay-net $NETWORK_ARGS"
+    NETWORK_ARGS="--network=liferay-proxy-net $NETWORK_ARGS"
   elif [[ "$USE_HOST_NETWORK" == "True" ]]; then
     NETWORK_ARGS="--network=host"
   fi
@@ -571,13 +590,17 @@ fi
     if ! command -v mkcert &> /dev/null; then
       error "mkcert is not installed. SSL support will be skipped."; USE_SSL=0
     else
-      CERT_DIR="$LIFERAY_ROOT/.certs"
+      fi
+      CERT_DIR="$HOME/.liferay_docker_certs"
       mkdir -p "$CERT_DIR"
       if [[ ! -f "$CERT_DIR/$HOST_NAME.pem" ]]; then
         info "Generating SSL certificate for $HOST_NAME..."
         mkcert -cert-file "$CERT_DIR/$HOST_NAME.pem" -key-file "$CERT_DIR/$HOST_NAME-key.pem" "$HOST_NAME" >/dev/null 2>&1
       fi
-      echo -e "tls:\n  certificates:\n    - certFile: /etc/traefik/certs/$HOST_NAME.pem\n      keyFile: /etc/traefik/certs/$HOST_NAME-key.pem" > "$CERT_DIR/traefik-dynamic.yml"
+      # Use a unique config name for each host
+      CONFIG_FILE="$CERT_DIR/traefik-$HOST_NAME.yml"
+      echo -e "tls:\n  certificates:\n    - certFile: /etc/traefik/certs/$HOST_NAME.pem\n      keyFile: /etc/traefik/certs/$HOST_NAME-key.pem" > "$CONFIG_FILE"
+      
       setup_infrastructure "$RESOLVED_IP" "$SSL_PORT" "$LIFERAY_ROOT"
     fi
   fi
@@ -628,7 +651,28 @@ else
     if [[ "$SSL_PORT" == "443" ]]; then ACCESS_PORT=""; else ACCESS_PORT=":$SSL_PORT"; fi
   fi
   access_url="${PROTO}://${HOST_NAME:-localhost}${ACCESS_PORT}"
-  info_custom "${Green}✅ Container ${CONTAINER_NAME} is up and running!"
+  
+  # --- Wait for Health Check ---
+  info "Waiting for Liferay to start (this may take 2-5 minutes)..."
+  START_TIME=$(date +%s)
+  TIMEOUT=600
+  IS_READY=0
+  while (( $(date +%s) - START_TIME < TIMEOUT )); do
+    if curl -k -I "$access_url" 2>/dev/null | grep -qE "HTTP/.* (200|302)"; then
+      IS_READY=1
+      break
+    fi
+    echo -n "."
+    sleep 10
+  done
+  echo -e "\n"
+
+  if [[ $IS_READY -eq 1 ]]; then
+    info_custom "${Green}✅ Container ${CONTAINER_NAME} is READY!"
+  else
+    error "Liferay is taking longer than expected to respond. Check logs for details."
+  fi
+
   info_custom "  ${White}🌐 URL:            ${Cyan}${access_url}"
   info_custom "  ${White}📄 Logs:           ${Cyan}docker logs -f ${CONTAINER_NAME}"
   

@@ -229,6 +229,8 @@ else
   fi
 fi
 [[ ! "$LIFERAY_ROOT" =~ ^(\.\/|\/).+$ ]] && LIFERAY_ROOT="./$LIFERAY_ROOT"
+# Normalize path to absolute
+LIFERAY_ROOT=$(cd "$LIFERAY_ROOT" 2>/dev/null && pwd || echo "$LIFERAY_ROOT")
 
 DEPLOY_VOLUME="$LIFERAY_ROOT/deploy"
 DATA_VOLUME="$LIFERAY_ROOT/data"
@@ -261,7 +263,8 @@ if [[ "${STOP_CONTAINER:u}" == "Y" && "$container_running" == "Y" ]]; then
   info_custom "${Yellow}Stopping ${Green}$CONTAINER_NAME"
   docker stop "$CONTAINER_NAME" >/dev/null 2>&1
   ! wait_for_container_stop "$CONTAINER_NAME" && _die "Container failed to stop within timeout."
-  sleep 2
+  # Add a safety buffer for external drive I/O latency (e.g. SanDisk/USB)
+  sleep 3
 fi
 
 timestamp=$(date +"%Y%m%d-%H%M%S")
@@ -372,6 +375,7 @@ if [[ $DB_ONLY -eq 0 ]]; then
     archive_file="$checkpoint_dir/volume.tgz"
     if [[ -d "$src_dir" ]]; then
       info "Capturing document_library..."
+      # Use the normalized absolute LIFERAY_ROOT to ensure consistency under sudo
       tar "${EXCLUDES[@]}" -czf "$archive_file" -C "$LIFERAY_ROOT/data" document_library
       [[ $? -ne 0 ]] && _die "Filesystem archival failed."
       _files_meta_value="$(basename "$archive_file")"
@@ -379,6 +383,7 @@ if [[ $DB_ONLY -eq 0 ]]; then
   else
     info "Archiving Liferay volumes..."
     files_archive="$checkpoint_dir/files.tar${COMPRESS_EXT}"
+    # Use the normalized absolute LIFERAY_ROOT to ensure consistency under sudo
     tar "${EXCLUDES[@]}" -c${TAR_FLAG:-}f "$files_archive" -C "$LIFERAY_ROOT" files scripts osgi data deploy modules
     [[ $? -ne 0 ]] && _die "Filesystem archival failed."
     _files_meta_value="$(basename "$files_archive")"
@@ -420,3 +425,5 @@ if [[ -n "$RETENTION_N" ]]; then
 fi
 
 info_custom "${Green}Backup created:${Color_Off} $checkpoint_dir ${SNAPSHOT_NAME:+($SNAPSHOT_NAME)}"
+echo -e "\n${White}Notice a bug or have a feature request? Please report it on GitHub at:"
+echo -e "${Cyan}https://github.com/peterrichards-lr/liferay-docker-scripts${Color_Off}"
