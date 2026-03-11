@@ -9,8 +9,17 @@ A collection of professional automation tools for managing Liferay Portal and DX
 The scripts in this repository are designed to work as an integrated suite:
 
 - **Runner Script:** `run-liferay-dxp-docker.sh` creates a standardized project layout (e.g., `files/`, `data/`, `osgi/`, `deploy/`).
-- **Management Scripts:** `liferay-docker.sh` (Python wrapper) provides a high-level manager for running, snapshoting, and restoring environments.
+- **Management Scripts:** `liferay-docker.sh` (Python wrapper) provides a high-level manager for running, snapshoting, and restoring environments. Features a **24-hour Shared Cache** for Docker Hub tags.
 - **Snapshot Scripts:** `create-docker-snapshot.sh` and `restore-docker-snapshot.sh` utilize the standardized layout to perform full database and filesystem backups.
+
+---
+
+## Tag Caching & Discovery
+
+To ensure high performance, the scripts cache Docker Hub API responses in `~/.liferay_docker_cache.json`.
+- **TTL:** 24 hours.
+- **Refresh:** Use the `--refresh` flag to force a new fetch from Docker Hub.
+- **Clear:** Run `./liferay-docker.sh clear-cache` to manually wipe the cache file.
 
 ---
 
@@ -84,6 +93,7 @@ Use unique virtual hostnames and loopback IPs to run instances side-by-side on t
 | `--db <type>` | Database type: `postgresql`, `mysql`, or `hypersonic`. | `hypersonic` |
 | `--disable-zip64` | Disable JVM Zip64 extra field validation. | Enabled |
 | `--select` | Browse and select from existing managed folders. | N/A |
+| `--refresh` | Force refresh of the Docker Hub tag cache. | N/A |
 | `-f, --follow` | Start container and automatically follow logs. | Background only |
 | `--remove-after` | Automatically remove the container after it stops. | Off |
 

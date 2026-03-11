@@ -7,6 +7,18 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VENV_PATH="$SCRIPT_DIR/.venv"
 PYTHON_SCRIPT="$SCRIPT_DIR/liferay_docker.py"
 PYTHON_EXEC="python3"
+CACHE_FILE="$HOME/.liferay_docker_cache.json"
+
+# Check for clear-cache command
+if [[ "$1" == "clear-cache" ]]; then
+    if [ -f "$CACHE_FILE" ]; then
+        rm "$CACHE_FILE"
+        echo "✅ Docker tag cache cleared."
+    else
+        echo "ℹ Cache is already empty."
+    fi
+    exit 0
+fi
 
 # Check if python3 is available
 if ! command -v $PYTHON_EXEC &> /dev/null; then

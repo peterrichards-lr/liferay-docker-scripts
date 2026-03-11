@@ -32,6 +32,36 @@ read_config() {
 }
 read_db_prop() { grep -E "^$1=" "$FILES_VOLUME/portal-ext.properties" | sed -e "s/^$1=//"; }
 
+wait_for_container_stop() {
+  local container="$1"
+  local timeout=30
+  local start=$(date +%s)
+  while (( $(date +%s) - start < timeout )); do
+    local status=$(docker inspect -f '{{.State.Status}} {{.State.Running}}' "$container" 2>/dev/null)
+    [[ -z "$status" ]] && return 0 # No longer exists
+    local parts=(${(z)status})
+    if [[ "${parts[1]}" == "exited" && "${parts[2]}" == "false" ]]; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
+safe_extract() {
+  local archive="$1"; local target="$2"
+  # Zip Slip protection: Check if archive contains paths that escape the target
+  if tar -tf "$archive" | grep -q "\.\./"; then
+    _die "Security Alert: Path traversal detected in archive: $archive"
+  fi
+  
+  case "$archive" in
+    *.gz) tar -xzf "$archive" -C "$target" ;;
+    *.xz) tar -xJf "$archive" -C "$target" ;;
+    *)    tar -xf  "$archive" -C "$target" ;;
+  esac
+}
+
 LIFERAY_ROOT_ARG=""
 BACKUPS_DIR_OVERRIDE=""
 CONTAINER_NAME_OVERRIDE=""
@@ -152,10 +182,38 @@ fi
 if [[ -n "$LIFERAY_ROOT_ARG" ]]; then
   LIFERAY_ROOT="$LIFERAY_ROOT_ARG"
 else
-  default_root="$(pwd)"
-  read_config "Liferay Root" LIFERAY_ROOT "$default_root"
+  # Smart detection
+  if [[ -d "files" || -d "deploy" || -f ".liferay-docker.meta" ]]; then
+    LIFERAY_ROOT="$(pwd)"
+  elif [[ "$NON_INTERACTIVE" -ne 1 ]]; then
+    folders=()
+    for d in */; do
+      d=${d%/}
+      if [[ -d "$d/files" || -d "$d/deploy" || -f "$d/.liferay-docker.meta" ]]; then
+        [[ "$d" != "common" && "$d" != .* ]] && folders+=("$d")
+      fi
+    done
+    
+    if (( ${#folders[@]} > 0 )); then
+      info_custom "${BYellow}=== Select Managed Folder for Restore ==="
+      for i in {1..${#folders[@]}}; do
+        info_custom "  [$i] ${folders[$i]}"
+      done
+      read_config "Select folder index" CHOICE_IDX 1
+      if [[ "$CHOICE_IDX" -gt 0 && "$CHOICE_IDX" -le ${#folders[@]} ]]; then
+        LIFERAY_ROOT="${folders[$CHOICE_IDX]}"
+      fi
+    fi
+  fi
+  
+  if [[ -z "$LIFERAY_ROOT" ]]; then
+    read_config "Liferay Root path" LIFERAY_ROOT ""
+    [[ -z "$LIFERAY_ROOT" ]] && _die "Liferay Root is required."
+  fi
 fi
 [[ ! "$LIFERAY_ROOT" =~ ^(\.\/|\/).+$ ]] && LIFERAY_ROOT="./$LIFERAY_ROOT"
+# Restrict to root
+LIFERAY_ROOT=$(realpath "$LIFERAY_ROOT")
 
 DEPLOY_VOLUME="$LIFERAY_ROOT/deploy"
 DATA_VOLUME="$LIFERAY_ROOT/data"
@@ -241,6 +299,8 @@ fi
 if [[ "${STOP_CONTAINER:u}" == "Y" && "$container_running" == "Y" ]]; then
   info_custom "${Yellow}Stopping ${Green}$CONTAINER_NAME"
   docker stop "$CONTAINER_NAME" >/dev/null 2>&1
+  ! wait_for_container_stop "$CONTAINER_NAME" && _die "Container failed to stop within timeout."
+  sleep 2
 fi
 
 if [[ "$NON_INTERACTIVE" -eq 1 && "${STOP_CONTAINER:u}" == "Y" && -n "$DELETE_STATE_FLAG" ]]; then
@@ -276,22 +336,6 @@ if [[ "$NON_INTERACTIVE" -ne 1 && "${STOP_CONTAINER:u}" == "Y" ]]; then
   fi
 fi
 
-find_dump() {
-  emulate -L zsh
-  setopt localoptions null_glob extended_glob
-  local dir="$1"; shift
-  local pat
-  for pat in "$@"; do
-    local -a matches
-    matches=($dir/$pat(N))
-    if (( ${#matches} )); then
-      print -r -- ${matches[1]}
-      return 0
-    fi
-  done
-  print -r -- ""
-}
-
 snapshot_type=""
 if [[ -f "$CHECKPOINT_DIR/meta" ]]; then
   snapshot_type=$(sed -n 's/^type=//p' "$CHECKPOINT_DIR/meta" | head -n1)
@@ -303,217 +347,91 @@ if [[ -f "$CHECKPOINT_DIR/meta" ]]; then
   [[ -n "$mv_line" ]] && meta_version="$mv_line"
 fi
 
+postgres_dump=""
+mysql_dump=""
+files_archive=""
+hypers_archive=""
+
 if [[ -f "$CHECKPOINT_DIR/meta" ]]; then
   meta_db_dump=$(sed -n 's/^db_dump=//p' "$CHECKPOINT_DIR/meta" | head -n1)
   meta_files_arc=$(sed -n 's/^files_archive=//p' "$CHECKPOINT_DIR/meta" | head -n1)
   if [[ -n "$meta_db_dump" ]]; then
-    [[ "$meta_db_dump" = /* ]] || meta_db_dump="$CHECKPOINT_DIR/$meta_db_dump"
+    db_path="$CHECKPOINT_DIR/$meta_db_dump"
     case "$snapshot_type" in
-      postgresql|postgres|pg)
-        postgres_dump="$meta_db_dump"
-        ;;
-      mysql|mariadb)
-        mysql_dump="$meta_db_dump"
-        ;;
+      postgresql|postgres|pg) postgres_dump="$db_path" ;;
+      mysql|mariadb) mysql_dump="$db_path" ;;
     esac
   fi
   if [[ -n "$meta_files_arc" ]]; then
-    [[ "$meta_files_arc" = /* ]] || meta_files_arc="$CHECKPOINT_DIR/$meta_files_arc"
-    files_archive="$meta_files_arc"
+    files_archive="$CHECKPOINT_DIR/$meta_files_arc"
   fi
 fi
 
-postgres_dump=$(find_dump "$CHECKPOINT_DIR" \
-  "db-postgresql.sql.*" \
-  "db-postgres.sql.*" \
-  "postgresql.sql.*" \
-  "postgres.sql.*" \
-  "pg.sql.*" \
-  "database-postgresql.sql.*" \
-  "database-postgres.sql.*" 2>/dev/null)
+# Fallbacks if meta is missing hints
+[[ -z "$postgres_dump" ]] && postgres_dump=$(find "$CHECKPOINT_DIR" -maxdepth 1 -name "db-postgresql.sql.*" -o -name "postgresql.sql.*" | head -n1)
+[[ -z "$mysql_dump" ]] && mysql_dump=$(find "$CHECKPOINT_DIR" -maxdepth 1 -name "db-mysql.sql.*" -o -name "mysql.sql.*" | head -n1)
+[[ -z "$files_archive" ]] && files_archive=$(find "$CHECKPOINT_DIR" -maxdepth 1 -name "files.tar.*" | head -n1)
+[[ -z "$hypers_archive" ]] && hypers_archive=$(find "$CHECKPOINT_DIR" -maxdepth 1 -name "filesystem.tar.*" | head -n1)
 
-mysql_dump=$(find_dump "$CHECKPOINT_DIR" \
-  "db-mysql.sql.*" \
-  "mysql.sql.*" \
-  "mariadb.sql.*" \
-  "database-mysql.sql.*" 2>/dev/null)
-
-files_archive=$(find_dump "$CHECKPOINT_DIR" "files.tar.*" 2>/dev/null)
-hypers_archive=$(find_dump "$CHECKPOINT_DIR" "filesystem.tar.*" 2>/dev/null)
-
-if [[ -z "$postgres_dump$mysql_dump" ]]; then
-  emulate -L zsh
-  setopt localoptions null_glob extended_glob
-  local -a sqls
-  sqls=($CHECKPOINT_DIR/*.sql.*(N))
-  if (( ${#sqls} == 1 )); then
-    case "$snapshot_type" in
-      postgresql|postgres|pg)
-        postgres_dump="${sqls[1]}"
-        ;;
-      mysql|mariadb)
-        mysql_dump="${sqls[1]}"
-        ;;
-    esac
-  fi
-fi
-
-FORMAT_INFERRED=0
 snapshot_format="standard"
 if [[ -f "$CHECKPOINT_DIR/meta" ]]; then
   fmt_line=$(sed -n 's/^format=//p' "$CHECKPOINT_DIR/meta" | head -n1)
-  if [[ -n "$fmt_line" ]]; then
-    snapshot_format="$fmt_line"
-    FORMAT_INFERRED=1
-  fi
-fi
-if [[ -f "$CHECKPOINT_DIR/database.gz" || -f "$CHECKPOINT_DIR/volume.tgz" ]]; then
-  snapshot_format="liferay-cloud"
-  FORMAT_INFERRED=1
-fi
-if [[ "$snapshot_format" == "liferay-cloud" && "$snapshot_type" == "hypersonic" ]]; then
-  _die "Liferay Cloud backups require PostgreSQL or MySQL; Hypersonic is not supported"
-fi
-if [[ -n "$FORMAT_OVERRIDE" ]]; then
-  snapshot_format="$FORMAT_OVERRIDE"
-elif [[ "$NON_INTERACTIVE" -ne 1 && "$FORMAT_INFERRED" -eq 0 ]]; then
-  read_config "Backup format (standard|liferay-cloud)" snapshot_format "$snapshot_format"
-  case "$snapshot_format" in
-    standard|liferay-cloud) : ;;
-    *) _die "Invalid format: $snapshot_format (expected: standard or liferay-cloud)" ;;
-  esac
-fi
-
-if [[ $VERBOSE -eq 1 ]]; then
-  echo "meta_version: $meta_version (min_supported=$MIN_META_VERSION, allow_legacy=$ALLOW_LEGACY)"
-  echo "snapshot: type=$snapshot_type format=$snapshot_format"
-  [[ -n "$meta_db_dump" ]] && echo "meta hint: db_dump=$meta_db_dump"
-  [[ -n "$meta_files_arc" ]] && echo "meta hint: files_archive=$meta_files_arc"
-  [[ -n "$postgres_dump" ]] && echo "candidate postgres dump: $postgres_dump"
-  [[ -n "$mysql_dump" ]] && echo "candidate mysql dump: $mysql_dump"
-  [[ -n "$files_archive" ]] && echo "candidate files archive: $files_archive"
-  [[ -n "$hypers_archive" ]] && echo "candidate hypers archive: $hypers_archive"
+  [[ -n "$fmt_line" ]] && snapshot_format="$fmt_line"
 fi
 
 if (( meta_version < MIN_META_VERSION )) && [[ "$ALLOW_LEGACY" -ne 1 ]]; then
-  _die "Backup meta_version=$meta_version is older than the minimum supported ($MIN_META_VERSION). Re-create the snapshot with the updated create script, or re-run with --allow-legacy to bypass this check."
+  _die "Backup meta_version=$meta_version is older than the minimum supported ($MIN_META_VERSION). Use --allow-legacy."
 fi
-
-_decompress_cmd() {
-  case "$1" in
-    *.gz) echo "gunzip -c" ;;
-    *.xz) echo "xz -dc" ;;
-    *)    echo "cat" ;;
-  esac
-}
-
-_tar_extract() {
-  local archive="$1"
-  case "$archive" in
-    *.gz) tar -xzf "$archive" -C "$2" ;;
-    *.xz) tar -xJf "$archive" -C "$2" ;;
-    *)    tar -xf  "$archive" -C "$2" ;;
-  esac
-}
 
 if [[ "$snapshot_type" == "hypersonic" ]]; then
   archive="$hypers_archive"
-  [[ -z "$archive" ]] && _die "Missing filesystem archive in $CHECKPOINT_DIR"
-  info "Restoring filesystem snapshot"
+  [[ -z "$archive" ]] && _die "Missing archive in $CHECKPOINT_DIR"
+  info "Restoring hypersonic snapshot"
   find "$LIFERAY_ROOT" -mindepth 1 -maxdepth 1 ! -name "backups" -exec rm -rf {} +
-  _tar_extract "$archive" "$LIFERAY_ROOT"
+  safe_extract "$archive" "$LIFERAY_ROOT"
 else
   jdbc_url=$(read_db_prop "jdbc.default.url")
   jdbc_user=$(read_db_prop "jdbc.default.username")
   jdbc_pass=$(read_db_prop "jdbc.default.password")
 
   if echo "$snapshot_type" | grep -qi "postgresql"; then
-    if [[ "$snapshot_format" == "liferay-cloud" ]]; then
-      dump_file="$CHECKPOINT_DIR/database.gz"
-    else
-      dump_file="$postgres_dump"
-    fi
-    [[ $VERBOSE -eq 1 ]] && echo "using database dump: $dump_file"
-    [[ -z "$dump_file" || ! -f "$dump_file" ]] && _die "PostgreSQL dump not found in $CHECKPOINT_DIR (looked for db-postgresql.sql.*, db-postgres.sql.*, postgresql.sql.*, postgres.sql.*, pg.sql.*, database-postgresql.sql.*, database-postgres.sql.* or a single *.sql.*)"
+    dump_file="${postgres_dump:-$CHECKPOINT_DIR/database.gz}"
+    [[ ! -f "$dump_file" ]] && _die "PostgreSQL dump not found."
     dbname=$(echo "$jdbc_url" | sed -E 's#^jdbc:postgresql://[^/]+/([^?]+).*#\1#')
-    pghost="${PG_HOST_OVERRIDE:-$(echo "$jdbc_url" | sed -E 's#^jdbc:postgresql://([^/:?]+).*$#\1#')}"
-    pgport="${PG_PORT_OVERRIDE:-$(echo "$jdbc_url" | sed -nE 's#^jdbc:postgresql://[^/:?]+:([0-9]+).*$#\1#p')}"
-    [[ -z "$pghost" || "$pghost" == "$jdbc_url" ]] && pghost="localhost"
+    pghost="${PG_HOST_OVERRIDE:-localhost}"
+    pgport="${PG_PORT_OVERRIDE:-5432}"
     [[ "$pghost" == "host.docker.internal" ]] && pghost="localhost"
-    [[ -z "$pgport" ]] && pgport=5432
 
-    info_custom "${Yellow}Resetting PostgreSQL database:${Color_Off} $dbname"
-    PGPASSWORD="$jdbc_pass" psql -h "$pghost" -p "$pgport" -U "$jdbc_user" -d postgres -v ON_ERROR_STOP=1 -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '$dbname' AND pid <> pg_backend_pid();" >/dev/null 2>&1
-    PGPASSWORD="$jdbc_pass" psql -h "$pghost" -p "$pgport" -U "$jdbc_user" -d postgres -v ON_ERROR_STOP=1 -c "DROP DATABASE IF EXISTS \"$dbname\";" >/dev/null
-    PGPASSWORD="$jdbc_pass" psql -h "$pghost" -p "$pgport" -U "$jdbc_user" -d postgres -v ON_ERROR_STOP=1 -c "CREATE DATABASE \"$dbname\" WITH TEMPLATE template0 ENCODING 'UTF8';" >/dev/null
+    info "Resetting PostgreSQL database: $dbname"
+    PGPASSWORD="$jdbc_pass" psql -h "$pghost" -p "$pgport" -U "$jdbc_user" -d postgres -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '$dbname' AND pid <> pg_backend_pid();" >/dev/null 2>&1
+    PGPASSWORD="$jdbc_pass" psql -h "$pghost" -p "$pgport" -U "$jdbc_user" -d postgres -c "DROP DATABASE IF EXISTS \"$dbname\"; CREATE DATABASE \"$dbname\" WITH TEMPLATE template0 ENCODING 'UTF8';" >/dev/null
 
-    info_custom "${Yellow}Importing PostgreSQL dump into:${Color_Off} $dbname"
-    if [[ "$snapshot_format" == "liferay-cloud" ]]; then
-      gunzip -c "$dump_file" | PGPASSWORD="$jdbc_pass" psql -h "$pghost" -p "$pgport" -U "$jdbc_user" -d "$dbname" >/dev/null
-    else
-      DECOMP=$(_decompress_cmd "$dump_file")
-      eval "$DECOMP" "$dump_file" | PGPASSWORD="$jdbc_pass" psql -h "$pghost" -p "$pgport" -U "$jdbc_user" -d "$dbname" >/dev/null
-    fi
-  else
-    if [[ "$snapshot_format" == "liferay-cloud" ]]; then
-      dump_file="$CHECKPOINT_DIR/database.gz"
-    else
-      dump_file="$mysql_dump"
-    fi
-    [[ $VERBOSE -eq 1 ]] && echo "using database dump: $dump_file"
-    [[ -z "$dump_file" || ! -f "$dump_file" ]] && _die "MySQL dump not found in $CHECKPOINT_DIR (looked for db-mysql.sql.*, mysql.sql.*, mariadb.sql.*, database-mysql.sql.* or a single *.sql.*)"
+    info "Importing PostgreSQL dump..."
+    if [[ "$dump_file" == *.gz ]]; then gunzip -c "$dump_file" | PGPASSWORD="$jdbc_pass" psql -h "$pghost" -p "$pgport" -U "$jdbc_user" -d "$dbname" >/dev/null
+    else cat "$dump_file" | PGPASSWORD="$jdbc_pass" psql -h "$pghost" -p "$pgport" -U "$jdbc_user" -d "$dbname" >/dev/null; fi
+  elif echo "$snapshot_type" | grep -qi "mysql"; then
+    dump_file="${mysql_dump:-$CHECKPOINT_DIR/database.gz}"
+    [[ ! -f "$dump_file" ]] && _die "MySQL dump not found."
     dbname=$(echo "$jdbc_url" | sed -E 's#^jdbc:mysql://[^/]+/([^?]+).*#\1#')
-    myhost="${MY_HOST_OVERRIDE:-$(echo "$jdbc_url" | sed -E 's#^jdbc:mysql://([^/:?]+).*$#\1#')}"
-    myport="${MY_PORT_OVERRIDE:-$(echo "$jdbc_url" | sed -nE 's#^jdbc:mysql://[^/:?]+:([0-9]+).*$#\1#p')}"
-    [[ -z "$myhost" || "$myhost" == "$jdbc_url" ]] && myhost="localhost"
+    myhost="${MY_HOST_OVERRIDE:-localhost}"
+    myport="${MY_PORT_OVERRIDE:-3306}"
     [[ "$myhost" == "host.docker.internal" ]] && myhost="localhost"
-    [[ -z "$myport" ]] && myport=3306
 
+    info "Resetting MySQL database: $dbname"
     mysql -h "$myhost" -P "$myport" -u "$jdbc_user" -p"$jdbc_pass" -e "DROP DATABASE IF EXISTS \`$dbname\`; CREATE DATABASE \`$dbname\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;" >/dev/null
-    info_custom "${Yellow}Importing MySQL dump into:${Color_Off} $dbname"
-    if [[ "$snapshot_format" == "liferay-cloud" ]]; then
-      gunzip -c "$dump_file" | mysql -h "$myhost" -P "$myport" -u "$jdbc_user" -p"$jdbc_pass" >/dev/null
-    else
-      DECOMP=$(_decompress_cmd "$dump_file")
-      eval "$DECOMP" "$dump_file" | mysql -h "$myhost" -P "$myport" -u "$jdbc_user" -p"$jdbc_pass" >/dev/null
-    fi
+    info "Importing MySQL dump..."
+    if [[ "$dump_file" == *.gz ]]; then gunzip -c "$dump_file" | mysql -h "$myhost" -P "$myport" -u "$jdbc_user" -p"$jdbc_pass" "$dbname" >/dev/null
+    else cat "$dump_file" | mysql -h "$myhost" -P "$myport" -u "$jdbc_user" -p"$jdbc_pass" "$dbname" >/dev/null; fi
   fi
 
   if [[ "$snapshot_format" == "liferay-cloud" ]]; then
-    info_custom "${Yellow}Applying Liferay Cloud backup:${Color_Off} database and doclib only. Other files (configs, scripts, OSGi state) are not applied automatically."
     vol="$CHECKPOINT_DIR/volume.tgz"
-    [[ $VERBOSE -eq 1 ]] && echo "using files archive: $vol"
-    if [[ -f "$vol" ]]; then
-      mkdir -p "$LIFERAY_ROOT/data"
-      tar -xzf "$vol" -C "$LIFERAY_ROOT/data"
-    fi
+    if [[ -f "$vol" ]]; then mkdir -p "$LIFERAY_ROOT/data" && safe_extract "$vol" "$LIFERAY_ROOT/data"; fi
   else
-    [[ -z "$files_archive" ]] && files_archive=$(find_dump "$CHECKPOINT_DIR" "files.tar.*")
-    if [[ -n "$files_archive" ]]; then
-      info "Restoring files archive"
-      [[ $VERBOSE -eq 1 ]] && echo "using files archive: $files_archive"
-      _tar_extract "$files_archive" "$LIFERAY_ROOT"
-    fi
+    [[ -n "$files_archive" ]] && safe_extract "$files_archive" "$LIFERAY_ROOT"
   fi
 fi
 
-DELETE_CHECKPOINT_DEFAULT=N
-if [[ -n "$DELETE_AFTER_FLAG" ]]; then
-  DELETE_CHECKPOINT=Y
-elif [[ -n "$KEEP_CHECKPOINT_FLAG" ]]; then
-  DELETE_CHECKPOINT=N
-else
-  read_config "Delete checkpoint after install" DELETE_CHECKPOINT "$DELETE_CHECKPOINT_DEFAULT"
-fi
-
-if [[ "${DELETE_CHECKPOINT:u}" == "Y" ]]; then
-  rm -rf "$CHECKPOINT_DIR"
-  info_custom "${Yellow}Deleted checkpoint:${Color_Off} $CHECKPOINT"
-fi
-
-if [[ "${STOP_CONTAINER:u}" == "Y" && "$container_exists" == "Y" ]]; then
-  info_custom "${Yellow}Starting ${Green}$CONTAINER_NAME"
-  docker start "$CONTAINER_NAME" >/dev/null 2>&1
-fi
-
+if [[ "${DELETE_AFTER_FLAG}" == 1 ]]; then rm -rf "$CHECKPOINT_DIR"; fi
+if [[ "${STOP_CONTAINER:u}" == "Y" && "$container_exists" == "Y" ]]; then docker start "$CONTAINER_NAME" >/dev/null 2>&1; fi
 info_custom "${Green}Restore complete${Color_Off}"

@@ -7,6 +7,7 @@ This repository contains automation tools for managing Liferay DXP instances usi
 - **Logic Source of Truth**: `liferay_docker.py` is the primary source of business logic for container management.
 - **Platform Parity**: Ensure that changes to `.sh` scripts (for macOS/Linux) have equivalent updates in `.bat` scripts (for Windows) where applicable.
 - **Idempotency**: All scripts must handle existing containers, volumes, and network configurations gracefully (e.g., using `docker ps -a` checks).
+- **Tag Caching**: Docker Hub API responses must be cached in `~/.liferay_docker_cache.json` for 24 hours to ensure high performance. Empty results for specific filters must also be cached to avoid redundant fetches.
 - **Snapshot Integrity**: Snapshot tools must verify the state of `data/document_library` and database connectivity before proceeding.
 - **Database Support**: Maintain support for Hypersonic (default), PostgreSQL, and MySQL.
 

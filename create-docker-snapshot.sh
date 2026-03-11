@@ -30,6 +30,22 @@ read_config() {
 }
 read_db_prop() { grep -E "^$1=" "$FILES_VOLUME/portal-ext.properties" | sed -e "s/^$1=//"; }
 
+wait_for_container_stop() {
+  local container="$1"
+  local timeout=30
+  local start=$(date +%s)
+  while (( $(date +%s) - start < timeout )); do
+    local status=$(docker inspect -f '{{.State.Status}} {{.State.Running}}' "$container" 2>/dev/null)
+    [[ -z "$status" ]] && return 0 # No longer exists
+    local parts=(${(z)status})
+    if [[ "${parts[1]}" == "exited" && "${parts[2]}" == "false" ]]; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
 LIFERAY_ROOT_ARG=""
 SNAPSHOT_NAME_ARG=""
 NO_SNAPSHOT_NAME=""
@@ -182,8 +198,34 @@ fi
 if [[ -n "$LIFERAY_ROOT_ARG" ]]; then
   LIFERAY_ROOT="$LIFERAY_ROOT_ARG"
 else
-  default_root="$(pwd)"
-  read_config "Liferay Root" LIFERAY_ROOT "$default_root"
+  # Smart detection
+  if [[ -d "files" || -d "deploy" || -f ".liferay-docker.meta" ]]; then
+    LIFERAY_ROOT="$(pwd)"
+  elif [[ "$NON_INTERACTIVE" -ne 1 ]]; then
+    folders=()
+    for d in */; do
+      d=${d%/}
+      if [[ -d "$d/files" || -d "$d/deploy" || -f "$d/.liferay-docker.meta" ]]; then
+        [[ "$d" != "common" && "$d" != .* ]] && folders+=("$d")
+      fi
+    done
+    
+    if (( ${#folders[@]} > 0 )); then
+      info_custom "${BYellow}=== Select Managed Folder for Snapshot ==="
+      for i in {1..${#folders[@]}}; do
+        info_custom "  [$i] ${folders[$i]}"
+      done
+      read_config "Select folder index" CHOICE_IDX 1
+      if [[ "$CHOICE_IDX" -gt 0 && "$CHOICE_IDX" -le ${#folders[@]} ]]; then
+        LIFERAY_ROOT="${folders[$CHOICE_IDX]}"
+      fi
+    fi
+  fi
+  
+  if [[ -z "$LIFERAY_ROOT" ]]; then
+    read_config "Liferay Root path" LIFERAY_ROOT ""
+    [[ -z "$LIFERAY_ROOT" ]] && _die "Liferay Root is required."
+  fi
 fi
 [[ ! "$LIFERAY_ROOT" =~ ^(\.\/|\/).+$ ]] && LIFERAY_ROOT="./$LIFERAY_ROOT"
 
@@ -217,6 +259,8 @@ fi
 if [[ "${STOP_CONTAINER:u}" == "Y" && "$container_running" == "Y" ]]; then
   info_custom "${Yellow}Stopping ${Green}$CONTAINER_NAME"
   docker stop "$CONTAINER_NAME" >/dev/null 2>&1
+  ! wait_for_container_stop "$CONTAINER_NAME" && _die "Container failed to stop within timeout."
+  sleep 2
 fi
 
 timestamp=$(date +"%Y%m%d-%H%M%S")
@@ -278,116 +322,56 @@ if [[ $FILES_ONLY -eq 0 ]]; then
     pgport="${PG_PORT_OVERRIDE:-5432}"
     [[ "$pghost" == "host.docker.internal" ]] && pghost="localhost"
     if [[ "$BACKUP_FORMAT" == "liferay-cloud" ]]; then
-      dump_file="$checkpoint_dir/database.gz"
-      _db_meta_value="$(basename "$dump_file")"
-      info "Dumping PostgreSQL database: $dbname"
-      if [[ $QUIET -eq 1 ]]; then
-        PGPASSWORD="$jdbc_pass" pg_dump -h "$pghost" -p "$pgport" -U "$jdbc_user" -d "$dbname" -F p --no-owner --no-privileges | gzip -c > "$dump_file" 2>/dev/null
-      else
-        PGPASSWORD="$jdbc_pass" pg_dump -h "$pghost" -p "$pgport" -U "$jdbc_user" -d "$dbname" -F p --no-owner --no-privileges | gzip -c > "$dump_file"
-      fi
+      dump_file="$checkpoint_dir/database.gz"; dump_cmd="pg_dump -h $pghost -p $pgport -U $jdbc_user -d $dbname -F p --no-owner --no-privileges | gzip -c"
     else
-      dump_file="$checkpoint_dir/db-postgresql.sql$COMPRESS_EXT"
-      _db_meta_value="$(basename "$dump_file")"
-      info "Dumping PostgreSQL database: $dbname"
-      if [[ $QUIET -eq 1 ]]; then
-        PGPASSWORD="$jdbc_pass" pg_dump -h "$pghost" -p "$pgport" -U "$jdbc_user" -d "$dbname" | eval "$COMPRESS_CMD" > "$dump_file" 2>/dev/null
-      else
-        PGPASSWORD="$jdbc_pass" pg_dump -h "$pghost" -p "$pgport" -U "$jdbc_user" -d "$dbname" | eval "$COMPRESS_CMD" > "$dump_file"
-      fi
+      dump_file="$checkpoint_dir/db-postgresql.sql$COMPRESS_EXT"; dump_cmd="pg_dump -h $pghost -p $pgport -U $jdbc_user -d $dbname | eval $COMPRESS_CMD"
     fi
+    info "Dumping PostgreSQL database: $dbname"
+    PGPASSWORD="$jdbc_pass" eval "$dump_cmd" > "$dump_file"
+    if [[ $? -ne 0 || ! -s "$dump_file" ]]; then rm -f "$dump_file"; _die "Database dump failed (PostgreSQL)."; fi
+    _db_meta_value="$(basename "$dump_file")"
   elif [[ "$snap_type" == "mysql" ]]; then
     dbname=$(echo "$jdbc_url" | sed -E 's#^jdbc:mysql://[^/]+/([^?]+).*#\1#')
     myhost="${MY_HOST_OVERRIDE:-localhost}"
     myport="${MY_PORT_OVERRIDE:-3306}"
     [[ "$myhost" == "host.docker.internal" ]] && myhost="localhost"
     if [[ "$BACKUP_FORMAT" == "liferay-cloud" ]]; then
-      dump_file="$checkpoint_dir/database.gz"
-      _db_meta_value="$(basename "$dump_file")"
-      info "Dumping MySQL database: $dbname"
-      if [[ $QUIET -eq 1 ]]; then
-        mysqldump -h "$myhost" -P "$myport" -u "$jdbc_user" -p"$jdbc_pass" --databases "$dbname" | gzip -c > "$dump_file" 2>/dev/null
-      else
-        mysqldump -h "$myhost" -P "$myport" -u "$jdbc_user" -p"$jdbc_pass" --databases "$dbname" | gzip -c > "$dump_file"
-      fi
+      dump_file="$checkpoint_dir/database.gz"; dump_cmd="mysqldump -h $myhost -P $myport -u $jdbc_user -p$jdbc_pass --databases $dbname | gzip -c"
     else
-      dump_file="$checkpoint_dir/db-mysql.sql$COMPRESS_EXT"
-      _db_meta_value="$(basename "$dump_file")"
-      info "Dumping MySQL database: $dbname"
-      if [[ $QUIET -eq 1 ]]; then
-        mysqldump -h "$myhost" -P "$myport" -u "$jdbc_user" -p"$jdbc_pass" --databases "$dbname" | eval "$COMPRESS_CMD" > "$dump_file" 2>/dev/null
-      else
-        mysqldump -h "$myhost" -P "$myport" -u "$jdbc_user" -p"$jdbc_pass" --databases "$dbname" | eval "$COMPRESS_CMD" > "$dump_file"
-      fi
+      dump_file="$checkpoint_dir/db-mysql.sql$COMPRESS_EXT"; dump_cmd="mysqldump -h $myhost -P $myport -u $jdbc_user -p$jdbc_pass --databases $dbname | eval $COMPRESS_CMD"
     fi
-  else
-    if [[ $DB_ONLY -eq 1 ]]; then
-      info_custom "${Yellow}No JDBC config detected; skipping DB dump (db-only requested).${Color_Off}"
-    fi
+    info "Dumping MySQL database: $dbname"
+    eval "$dump_cmd" > "$dump_file"
+    if [[ $? -ne 0 || ! -s "$dump_file" ]]; then rm -f "$dump_file"; _die "Database dump failed (MySQL)."; fi
+    _db_meta_value="$(basename "$dump_file")"
   fi
 fi
 
 if [[ $DB_ONLY -eq 0 ]]; then
+  # Exclude generated/volatile directories
+  EXCLUDES=("--exclude=osgi/state" "--exclude=data/elasticsearch7" "--exclude=data/elasticsearch" "--exclude=*.sock" "--exclude=*.lock")
   if [[ "$BACKUP_FORMAT" == "liferay-cloud" ]]; then
     src_dir="$LIFERAY_ROOT/data/document_library"
     archive_file="$checkpoint_dir/volume.tgz"
-    _files_meta_value="$(basename "$archive_file")"
     if [[ -d "$src_dir" ]]; then
-      if [[ $QUIET -eq 1 ]]; then
-        tar -czf "$archive_file" -C "$LIFERAY_ROOT/data" document_library 2>/dev/null
-      else
-        tar -czf "$archive_file" -C "$LIFERAY_ROOT/data" document_library 2>/dev/null
-      fi
+      info "Capturing document_library..."
+      tar "${EXCLUDES[@]}" -czf "$archive_file" -C "$LIFERAY_ROOT/data" document_library
+      [[ $? -ne 0 ]] && _die "Filesystem archival failed."
+      _files_meta_value="$(basename "$archive_file")"
     fi
   else
-    info "Archiving Liferay volumes"
+    info "Archiving Liferay volumes..."
     files_archive="$checkpoint_dir/files.tar${COMPRESS_EXT}"
+    tar "${EXCLUDES[@]}" -c${TAR_FLAG:-}f "$files_archive" -C "$LIFERAY_ROOT" files scripts osgi data deploy modules
+    [[ $? -ne 0 ]] && _die "Filesystem archival failed."
     _files_meta_value="$(basename "$files_archive")"
-    if [[ -n "$TAR_FLAG" ]]; then
-      if [[ $QUIET -eq 1 ]]; then
-        tar -c${TAR_FLAG}f "$files_archive" -C "$LIFERAY_ROOT" files scripts osgi data deploy 2>/dev/null
-      else
-        tar -c${TAR_FLAG}f "$files_archive" -C "$LIFERAY_ROOT" files scripts osgi data deploy 2>/dev/null
-      fi
-    else
-      if [[ $QUIET -eq 1 ]]; then
-        tar -cf "$files_archive" -C "$LIFERAY_ROOT" files scripts osgi data deploy 2>/dev/null
-      else
-        tar -cf "$files_archive" -C "$LIFERAY_ROOT" files scripts osgi data deploy 2>/dev/null
-      fi
-    fi
   fi
 fi
 
 if [[ $VERIFY -eq 1 ]]; then
-  info "Verifying snapshot integrity"
-  if [[ "$BACKUP_FORMAT" == "liferay-cloud" ]]; then
-    if [[ -f "$checkpoint_dir/database.gz" ]]; then
-      gzip -t "$checkpoint_dir/database.gz" || _die "Verification failed: database.gz"
-    fi
-    if [[ -f "$checkpoint_dir/volume.tgz" ]]; then
-      tar -tf "$checkpoint_dir/volume.tgz" >/dev/null || _die "Verification failed: volume.tgz"
-    else
-      _die "Verification failed: volume.tgz missing"
-    fi
-  else
-    if ls "$checkpoint_dir"/db-*.sql* >/dev/null 2>&1; then
-      for f in "$checkpoint_dir"/db-*.sql*; do
-        case "$f" in
-          *.gz)  gzip -t "$f" || _die "Verification failed: $f" ;;
-          *.xz)  xz -t "$f" || _die "Verification failed: $f" ;;
-          *.sql) [[ -s "$f" ]] || _die "Verification failed (empty): $f" ;;
-        esac
-      done
-    fi
-    if ls "$checkpoint_dir"/files.tar* >/dev/null 2>&1; then
-      if [[ "$COMPRESSION" == "none" ]]; then
-        tar -tf "$checkpoint_dir/files.tar" >/dev/null || _die "Verification failed: files.tar"
-      else
-        tar -tf "$checkpoint_dir/files.tar${COMPRESS_EXT}" >/dev/null || _die "Verification failed: files.tar${COMPRESS_EXT}"
-      fi
-    fi
-  fi
+  info "Verifying snapshot integrity..."
+  [[ -n "$_db_meta_value" ]] && { case "$_db_meta_value" in *.gz) gzip -t "$checkpoint_dir/$_db_meta_value" ;; *.xz) xz -t "$checkpoint_dir/$_db_meta_value" ;; esac || _die "DB dump verification failed."; }
+  [[ -n "$_files_meta_value" ]] && { tar -tf "$checkpoint_dir/$_files_meta_value" >/dev/null || _die "Files archive verification failed."; }
 fi
 
 {
@@ -418,20 +402,4 @@ if [[ -n "$RETENTION_N" ]]; then
   fi
 fi
 
-if [[ -n "$SNAPSHOT_NAME" ]]; then
-  info_custom "${Green}Backup created:${Color_Off} $checkpoint_dir  ${BYellow}($SNAPSHOT_NAME)"
-else
-  info_custom "${Green}Backup created:${Color_Off} $checkpoint_dir"
-fi
-
-if [[ "$BACKUP_FORMAT" == "liferay-cloud" ]]; then
-  up_db="$checkpoint_dir/database.gz"
-  up_vol="$checkpoint_dir/volume.tgz"
-  info_custom "${Yellow}Example Liferay Cloud upload (edit URL and TOKEN):${Color_Off}"
-  echo "curl -X POST \\\""
-  echo "  https://your-project.your-env.lfr.cloud/backup/upload \\\""
-  echo "  -H 'Content-Type: multipart/form-data' \\\""
-  echo "  -H 'dxpcloud-authorization: Bearer TOKEN' \\\""
-  echo "  -F 'database=@$up_db' \\\""
-  echo "  -F 'volume=@$up_vol'"
-fi
+info_custom "${Green}Backup created:${Color_Off} $checkpoint_dir ${SNAPSHOT_NAME:+($SNAPSHOT_NAME)}"
