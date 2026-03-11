@@ -8,7 +8,12 @@ This repository contains automation tools for managing Liferay DXP instances usi
 - **Platform Parity**: Ensure that changes to `.sh` scripts (for macOS/Linux) have equivalent updates in `.bat` scripts (for Windows) where applicable.
 - **Idempotency**: All scripts must handle existing containers, volumes, and network configurations gracefully (e.g., using `docker ps -a` checks).
 - **Tag Caching**: Docker Hub API responses must be cached in `~/.liferay_docker_cache.json` for 24 hours to ensure high performance. Empty results for specific filters must also be cached to avoid redundant fetches.
-- **Snapshot Integrity**: Snapshot tools must verify the state of `data/document_library` and database connectivity before proceeding.
+- **Atomic Metadata**: Updates to project metadata (`.liferay-docker.meta`) must be atomic, using temporary files and standard replacement (e.g., `os.replace` or `mv`) to prevent corruption.
+- **Container Safety**: Before deleting mapped volumes or clearing state, scripts must verify the container is in an `exited` status. A 2-second safety sleep must be enforced after stopping to allow the host OS to release file handles. If the container fails to stop or remains running, the script must abort the deletion operation and warn the user to prevent volume corruption.
+- **Snapshot Integrity**: Snapshot tools must verify the state of `data/document_library` and database connectivity before proceeding. DB dumps must be verified for reachability and authentication using dummy queries (e.g., `SELECT 1`) before archiving files. Success must be confirmed via process return codes and resulting archive integrity (non-zero size).
+- **Security Safeguards**:
+  - **Zip Slip Protection**: Extractions must validate all member paths against the target root to prevent path traversal.
+  - **Property Management**: `portal-ext.properties` must be updated using regex-based in-place replacements to avoid duplicate key entries.
 - **Database Support**: Maintain support for Hypersonic (default), PostgreSQL, and MySQL.
 
 ## Engineering Standards

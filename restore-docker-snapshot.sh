@@ -6,6 +6,7 @@ SCRIPT_VERSION="2025-11-12"
 MIN_META_VERSION=2
 ALLOW_LEGACY=0
 
+export DOCKER_CLI_HINTS=false
 Color_Off='\033[0m'
 Green='\033[0;32m'
 Yellow='\033[0;33m'

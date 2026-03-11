@@ -21,6 +21,7 @@ if ! docker info >/dev/null 2>&1; then
   _die "Docker is not running or not accessible. Please start Docker and try again."
 fi
 
+export DOCKER_CLI_HINTS=false
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 IMAGE_NAME=liferay/dxp
 PROJECT_META_FILE=".liferay-docker.meta"
@@ -435,9 +436,23 @@ fi
 
 FILES_VOLUME="$LIFERAY_ROOT/files"; STATE_VOLUME="$LIFERAY_ROOT/osgi/state"
 
-docker container inspect "$CONTAINER_NAME" >/dev/null 2>&1
-if [ $? -eq 1 ]; then
+FORCE_INIT=0
+if docker container inspect "$CONTAINER_NAME" >/dev/null 2>&1; then
+  if [[ $NON_INTERACTIVE -eq 0 ]]; then
+    read_config "Container '$CONTAINER_NAME' already exists. Would you like to remove it and re-initialize?" REMOVE_EXISTING N
+    if [[ "${REMOVE_EXISTING:u}" == "Y" ]]; then
+      info "Removing existing container $CONTAINER_NAME..."
+      docker rm -f "$CONTAINER_NAME" >/dev/null
+      FORCE_INIT=1
+    fi
+  fi
+else
+  FORCE_INIT=1
+fi
+
+if [[ $FORCE_INIT -eq 1 ]]; then
   info_custom "${BYELLOW}=== Initializing $CONTAINER_NAME ==="
+
   [[ -n "$REMOVE_AFTER_FLAG" ]] && REMOVE_CONTAINER=Y || { [[ -n "$KEEP_CONTAINER_FLAG" ]] && REMOVE_CONTAINER=N || read_config "Remove container afterwards" REMOVE_CONTAINER Y; }
   
   if [[ -n "$DB_KIND" ]]; then LIFERAY_DATABASE="$DB_KIND"; else
@@ -490,13 +505,28 @@ else
   [[ -n "$REMOVE_AFTER_FLAG" ]] && REMOVE_CONTAINER=Y || read_config "Remove container afterwards" REMOVE_CONTAINER N
   [[ -n "$DELETE_STATE_FLAG" ]] && RS=Y || read_config "Delete OSGi state folder" RS Y
   if [[ "${RS:u}" == "Y" ]]; then
+    DELETE_STATE=1
     if docker ps -q --filter "name=^${CONTAINER_NAME}$" | grep -q .; then
       info "Stopping $CONTAINER_NAME to clear state..."
-      docker stop "$CONTAINER_NAME" >/dev/null
-      ! wait_for_container_stop "$CONTAINER_NAME" && _die "Container failed to stop."
-      sleep 2
+      STOP_OUT=$(docker stop "$CONTAINER_NAME" 2>&1)
+      if [[ $? -ne 0 ]]; then
+        error "Failed to stop container: $STOP_OUT"
+        error "Aborting OSGi state deletion to prevent volume corruption."
+        DELETE_STATE=0
+      else
+        if ! wait_for_container_stop "$CONTAINER_NAME"; then
+          error "Container failed to stop within timeout."
+          error "Aborting OSGi state deletion to prevent volume corruption."
+          DELETE_STATE=0
+        else
+          sleep 2
+        fi
+      fi
     fi
-    info "Clearing OSGi state..."; rm -rf "$STATE_VOLUME" 2>/dev/null; mkdir -p "$STATE_VOLUME"; fi
+    if [[ $DELETE_STATE -eq 1 ]]; then
+      info "Clearing OSGi state..."; rm -rf "$STATE_VOLUME" 2>/dev/null; mkdir -p "$STATE_VOLUME"
+    fi
+  fi
 fi
 
 CURRENT_JDBC_URL=$(grep "^jdbc.default.url=" "$FILES_VOLUME/portal-ext.properties" 2>/dev/null | cut -d'=' -f2-)
@@ -506,6 +536,6 @@ if [[ $FOLLOW_FLAG -eq 1 ]]; then
   docker start -i -a "${CONTAINER_NAME}" || { [[ "$(docker inspect -f '{{.State.ExitCode}}' $CONTAINER_NAME)" == "130" ]] || exit $?; }
 else
   info "Starting ${CONTAINER_NAME}..."; docker start "${CONTAINER_NAME}" >/dev/null || exit $?
-  info "Container started.\n  Logs: ${Cyan}docker logs -f ${CONTAINER_NAME}${Color_Off}\n  URL:  ${Cyan}http://${HOST_NAME:-localhost}:${LOCAL_PORT:-8080}${Color_Off}"
+  info "Container started.\n  Logs: ${Cyan}docker logs -f ${CONTAINER_NAME}${Color_Off}\n  URL:  ${Cyan}http://${HOST_NAME:-localhost}:${LOCAL_PORT:-8080}${Color_Off}\n  Stop: ${Cyan}docker rm -f ${CONTAINER_NAME}${Color_Off}"
 fi
 [[ "${REMOVE_CONTAINER:u}" == "Y" ]] && { info "Deleting $CONTAINER_NAME"; docker rm --force "$CONTAINER_NAME" >/dev/null 2>&1; }
