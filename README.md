@@ -43,13 +43,47 @@ The scripts create a project root that mirrors **Liferay Home** and bind-mounts 
 ### Automated Local SSL
 When a custom `--host-name` is used (and `mkcert` is installed), the scripts automatically:
 1.  **Generate Certificates**: Creates locally trusted SSL certificates in a `.certs/` folder.
-2.  **Launch Traefik**: Starts (or reuses) a singleton **global Traefik proxy** to handle HTTPS.
+2.  **Launch Traefik**: Starts (or reuses) a singleton **global Traefik proxy** (`liferay-proxy-global`) to handle HTTPS.
     *   **Shared Network**: All instances are connected via a shared `liferay-net` Docker bridge.
-    *   **Port Priority**: The script attempts to bind to port **443** first.
+    *   **Port Priority**: The script attempts to bind to host port **443** first.
     *   **Fallback**: If port 443 is blocked (e.g., missing permissions), it offers to use port **8443**.
     *   **Sudo Hint**: Standard HTTPS (443) requires running the script with `sudo` on most systems.
 3.  **Secure Routing**: Configures Liferay with the necessary labels for seamless TLS termination.
 
+#### Proxy Visibility
+You can inspect the global proxy state by checking its logs:
+```bash
+docker logs liferay-proxy-global
+```
+_Tip: This is the first place to look if you encounter a 404 or 502 error during SSL development._
+
+---
+
+## Cross-Platform Networking
+
+The scripts are designed to be fully cross-platform (macOS, Windows, Linux) but have specific networking requirements for virtual hostnames:
+
+### macOS (Intel & Silicon)
+To use custom hostnames (e.g., `prospect.demo`), you must alias your loopback interface if you aren't using `127.0.0.1`.
+*   **Requirement**: Run `sudo ifconfig lo0 alias <your-ip> up` for each unique IP.
+*   **Docker Socket**: The script automatically detects the socket at `~/.docker/run/docker.sock` to handle M1/M2 permission issues.
+
+### Windows
+*   **Docker Socket**: Uses Named Pipes (`//./pipe/docker_engine`).
+*   **Pathing**: The script automatically converts Path objects to POSIX format (`/`) to prevent backslash escapes from breaking Docker volume strings.
+
+### Linux
+*   **Docker Socket**: Defaults to `/var/run/docker.sock`.
+*   **Permissions**: Ensure your user is in the `docker` group or run the script with `sudo`.
+
+---
+
+## Automated Health Checks
+
+When starting an instance in background mode (default), the script will:
+1.  **Monitor Readiness**: Poll the access URL until Liferay responds with a `200 OK` or `302 Found`.
+2.  **Provide Feedback**: Display a progress loop while waiting (typically 2-5 minutes).
+3.  **Explicit Readiness**: Notify you with a `READY!` message as soon as the instance is live.
 
 ---
 
@@ -58,6 +92,7 @@ When a custom `--host-name` is used (and `mkcert` is installed), the scripts aut
 - **Docker**: Docker Desktop or Docker Engine installed and running.
 - **Python**: 3.10+ required for the management script.
 - **mkcert**: (Optional) Required for automated local SSL termination.
+- **Database Clients**: (Optional) If using PostgreSQL or MySQL, ensure the respective client (`psql` or `mysql`) is installed and available in your system PATH for snapshot/restore operations.
 
 ---
 

@@ -1,6 +1,7 @@
 import os
 import re
 import sys
+import platform
 import json
 import time
 import shutil
@@ -349,12 +350,15 @@ class LiferayManager:
             print(f"\n{UI.BYELLOW}ACTION REQUIRED:{UI.COLOR_OFF} Please run the following command to trust mkcert:")
             print(f"{UI.CYAN}mkcert -install{UI.COLOR_OFF}\n")
             UI.die("Root CA trust is required for automated SSL.")
-
     def setup_ssl(self, paths, host_name):
         if not host_name or host_name == "localhost":
             return False
         
-        cert_dir = paths["certs"]
+        real_user = os.environ.get("SUDO_USER") or os.environ.get("USER")
+        actual_home = Path(f"/Users/{real_user}") if platform.system() == "darwin" else Path.home()
+        cert_dir = actual_home / ".liferay_docker_certs"
+        
+        # Ensure directory exists and is owned by the real user
         cert_dir.mkdir(parents=True, exist_ok=True)
         
         cert_file = cert_dir / f"{host_name}.pem"
@@ -362,16 +366,19 @@ class LiferayManager:
         
         if not cert_file.exists():
             UI.info(f"Generating SSL certificate for {host_name}...")
+            # Use 'sudo -u' to drop privileges back to the real user for mkcert
+            cmd = ["sudo", "-u", real_user, "mkcert", "-cert-file", str(cert_file), "-key-file", str(key_file), host_name]
             try:
-                subprocess.run(
-                    ["mkcert", "-cert-file", str(cert_file), "-key-file", str(key_file), host_name],
-                    check=True, capture_output=True
-                )
+                subprocess.run(cmd, check=True, capture_output=True)
             except subprocess.CalledProcessError as e:
-                UI.error(f"mkcert generation failed: {e.stderr.decode().strip()}")
+                UI.error(f"mkcert failed: {e.stderr.decode().strip()}")
                 return False
 
-        config_path = cert_dir / "traefik-dynamic.yml"
+        # Set permissions so the global Traefik container can read them
+        os.chmod(cert_file, 0o644)
+        os.chmod(key_file, 0o644)
+
+        config_path = cert_dir / f"traefik-{host_name}.yml"
         config_content = f"""
 tls:
   certificates:
@@ -379,35 +386,68 @@ tls:
       keyFile: /etc/traefik/certs/{host_name}-key.pem
 """
         with open(config_path, "w") as f:
-            f.write(config_content.strip())
+            f.write(config_content)
+        os.chmod(config_path, 0o644)
             
         return True
 
+    def get_docker_socket_params(self):
+        """Returns (mount_args_list, traefik_endpoint_flag) based on OS."""
+        system = sys.platform
+        
+        if system == "darwin":  # macOS
+            real_socket = Path.home() / ".docker/run/docker.sock"
+            path = str(real_socket) if real_socket.exists() else "/var/run/docker.sock"
+            return ["-v", f"{path}:/var/run/docker.sock:ro"], "--providers.docker.endpoint=unix:///var/run/docker.sock"
+        
+        elif system == "win32":  # Windows
+            return ["-v", "//./pipe/docker_engine://./pipe/docker_engine"], "--providers.docker.endpoint=npipe:////./pipe/docker_engine"
+        
+        else:  # Linux
+            return ["-v", "/var/run/docker.sock:/var/run/docker.sock:ro"], "--providers.docker.endpoint=unix:///var/run/docker.sock"
+
     def setup_infrastructure(self, resolved_ip, ssl_port, paths):
-        """Ensures the shared liferay-net bridge and liferay-proxy-global exist."""
-        # 1. Silent Network Creation
-        run_command(["docker", "network", "inspect", "liferay-net"], check=False) or \
+        # 1. Create the shared network
         run_command(["docker", "network", "create", "liferay-net"], check=False)
 
-        # 2. Singleton Proxy Check
-        proxy_name = "liferay-proxy-global"
-        proxy_running = run_command(["docker", "ps", "-q", "-f", f"name={proxy_name}"])
-        if proxy_running:
-            return True
+        real_user = os.environ.get("SUDO_USER") or os.environ.get("USER")
+        if platform.system() == "darwin":
+            actual_home = Path(f"/Users/{real_user}")
+        else:
+            actual_home = Path.home()
 
-        UI.info("Starting global Traefik SSL proxy...")
-        run_command(["docker", "rm", "-f", proxy_name], check=False)
-        run_command(["docker", "pull", "traefik:v3.3"], capture_output=False)
+        global_cert_dir = actual_home / ".liferay_docker_certs"
+        global_cert_dir.mkdir(parents=True, exist_ok=True)
+
+        # 3. Start the Socket Proxy
+        api_proxy = "docker-socket-proxy"
+        run_command(["docker", "rm", "-f", api_proxy], check=False)
         
+        real_socket_path = f"{Path.home()}/.docker/run/docker.sock"
+        
+        UI.info("Starting Docker Socket Proxy bridge...")
+        run_command([
+            "docker", "run", "-d", "--name", api_proxy,
+            "--network", "liferay-net",
+            "-v", f"{real_socket_path}:/var/run/docker.sock:ro",
+            "alpine/socat", 
+            "TCP-LISTEN:2375,fork,reuseaddr", "UNIX-CONNECT:/var/run/docker.sock"
+        ])
+
+        # 4. Start Traefik
+        proxy_name = "liferay-proxy-global"
+        run_command(["docker", "rm", "-f", proxy_name], check=False)
+
         traefik_cmd = [
             "docker", "run", "-d", "--rm",
             "--name", proxy_name,
             "--network", "liferay-net",
             "-p", f"{resolved_ip}:{ssl_port}:443",
-            "-v", "/var/run/docker.sock:/var/run/docker.sock:ro",
-            "-v", f"{paths['certs']}:/etc/traefik/certs:ro",
-            "traefik:v3.3",
+            "-e", "DOCKER_API_VERSION=1.44", 
+            "-v", f"{global_cert_dir.as_posix()}:/etc/traefik/certs:ro", # Now defined!
+            "traefik:v3.6.1", 
             "--providers.docker=true",
+            f"--providers.docker.endpoint=tcp://{api_proxy}:2375",
             "--providers.docker.exposedbydefault=false",
             "--entrypoints.websecure.address=:443",
             "--providers.file.directory=/etc/traefik/certs",
@@ -549,6 +589,9 @@ tls:
         if not self.check_docker():
             UI.die("Docker is not running or not accessible. Please start Docker and try again.")
 
+        # Ensure global proxy network exists
+        run_command(["docker", "network", "create", "liferay-net"], check=False)
+
         if getattr(self.args, 'select', False):
             roots = self.find_dxp_roots()
             UI.heading("Available DXP Folders")
@@ -615,18 +658,23 @@ tls:
                 # Singleton Proxy Detection
                 proxy_running = run_command(["docker", "ps", "-q", "-f", "name=liferay-proxy-global"])
                 if not proxy_running:
-                    UI.error(f"Host port 443 is blocked on {resolved_ip}.")
-                    UI.info("HINT: To use the standard HTTPS port, run this script with sudo.")
-                    
-                    if not self.non_interactive:
-                        if UI.ask("Would you like to continue using port 8443 instead?", "Y").upper() == "Y":
-                            if not self.is_port_available(8443, resolved_ip):
-                                UI.die(f"Host port 8443 is also in use on {resolved_ip}. Aborting SSL setup.")
-                            ssl_port = 8443
-                        else:
-                            sys.exit(0)
+                    if platform.system() == "Darwin":
+                        UI.info("Port 443 check failed, but Docker Desktop for Mac may still allow it.")
+                        # On macOS, we proceed with 443 as the default despite the socket check
+                        ssl_port = 443 
                     else:
-                        UI.die("Port 443 unavailable in non-interactive mode. Aborting.")
+                        UI.error(f"Host port 443 is blocked on {resolved_ip}.")
+                        UI.info("HINT: To use the standard HTTPS port, run this script with sudo.")
+                        
+                        if not self.non_interactive:
+                            if UI.ask("Would you like to continue using port 8443 instead?", "Y").upper() == "Y":
+                                if not self.is_port_available(8443, resolved_ip):
+                                    UI.die(f"Host port 8443 is also in use on {resolved_ip}. Aborting SSL setup.")
+                                ssl_port = 8443
+                            else:
+                                sys.exit(0)
+                        else:
+                            UI.die("Port 443 unavailable in non-interactive mode. Aborting.")
 
             self.check_mkcert()
 
@@ -785,13 +833,13 @@ tls:
             if use_ssl:
                 net_args = ["--network", "liferay-net"] + net_args
 
-            # ES Port: Skip prompt and handle busy port gracefully
-            es_port = es_port or 9200
-            if not use_host_net:
+            # ES Port: Only expose if explicitly requested via CLI
+            if not use_host_net and getattr(self.args, 'es_port', None):
+                es_port = self.args.es_port
                 if self.is_port_available(es_port, resolved_ip):
                     net_args += ["-p", f"{resolved_ip}:{es_port}:9200"]
                 else:
-                    UI.info(f"Note: Host port {es_port} is busy. ES sidecar is active internally but not exposed.")
+                    UI.info(f"Note: Requested ES port {es_port} is busy. ES sidecar not exposed to host.")
 
             env_args = []
             if disable_zip64:
@@ -814,7 +862,7 @@ tls:
                 host_updates["session.cookie.use.full.hostname"] = "true"
                 host_updates["virtual.hosts.valid.hosts"] = f"localhost,127.0.0.1,[::1],{host_name},{resolved_ip}"
 
-            if es_port and str(es_port) != "9200":
+            if es_port and str(es_port).isdigit() and str(es_port) != "9200":
                 es_transport = str(int(es_port) + 100)
                 host_updates["module.framework.properties.com.liferay.portal.search.elasticsearch7.configuration.ElasticsearchConfiguration.sidecarHttpPort"] = str(es_port)
                 host_updates["module.framework.properties.com.liferay.portal.search.elasticsearch7.configuration.ElasticsearchConfiguration.transportTcpPort"] = es_transport
@@ -829,6 +877,7 @@ tls:
             if use_ssl:
                 labels = [
                     "--label", "traefik.enable=true",
+                    # Changed single quotes to backticks for Traefik v3 compatibility
                     "--label", f"traefik.http.routers.{container_name}.rule=Host(`{host_name}`)",
                     "--label", f"traefik.http.routers.{container_name}.entrypoints=websecure",
                     "--label", f"traefik.http.routers.{container_name}.tls=true",
@@ -839,13 +888,13 @@ tls:
             docker_cmd = [
                 "docker", "create", "-it", 
                 "--name", container_name] + rm_arg + net_args + env_args + labels + [
-                "-v", f"{paths['files']}:/mnt/liferay/files",
-                "-v", f"{paths['scripts']}:/mnt/liferay/scripts",
-                "-v", f"{paths['state']}:/opt/liferay/osgi/state",
-                "-v", f"{paths['modules']}:/opt/liferay/modules",
-                "-v", f"{paths['data']}:/opt/liferay/data",
-                "-v", f"{paths['deploy']}:/mnt/liferay/deploy",
-                "-v", f"{paths['cx']}:/opt/liferay/osgi/client-extensions",
+                "-v", f"{paths['files'].as_posix()}:/mnt/liferay/files",
+                "-v", f"{paths['scripts'].as_posix()}:/mnt/liferay/scripts",
+                "-v", f"{paths['state'].as_posix()}:/opt/liferay/osgi/state",
+                "-v", f"{paths['modules'].as_posix()}:/opt/liferay/modules",
+                "-v", f"{paths['data'].as_posix()}:/opt/liferay/data",
+                "-v", f"{paths['deploy'].as_posix()}:/mnt/liferay/deploy",
+                "-v", f"{paths['cx'].as_posix()}:/opt/liferay/osgi/client-extensions",
                 image_tag
             ]
             run_command(docker_cmd)
@@ -905,7 +954,38 @@ tls:
                     access_port = f":{port}"
                 
                 access_url = f"{proto}://{host_name or 'localhost'}{access_port}"
-                UI.success(f"Container {container_name} is up and running!")
+                
+                # --- Wait for Health Check ---
+                UI.info("Waiting for Liferay to start (this may take 2-5 minutes)...")
+                start_time = time.time()
+                timeout = 600  # 10 minute maximum wait
+                is_ready = False
+
+                while time.time() - start_time < timeout:
+                    try:
+                        # -k to ignore self-signed certs during wait
+                        # -I to fetch headers only
+                        check_cmd = ["curl", "-k", "-I", access_url]
+                        result = run_command(check_cmd, check=False)
+                        
+                        if result and ("200" in result or "302" in result):
+                            is_ready = True
+                            break
+                    except Exception:
+                        pass
+                    
+                    sys.stdout.write(".")
+                    sys.stdout.flush()
+                    time.sleep(10)
+                
+                print("\n")
+
+                if is_ready:
+                    UI.success(f"Container {container_name} is READY!")
+                else:
+                    UI.error("Liferay is taking longer than expected to respond. Check logs for details.")
+
+                # Final Success Block
                 print(f"  {UI.WHITE}🌐 URL:            {UI.CYAN}{access_url}{UI.COLOR_OFF}")
                 print(f"  {UI.WHITE}📄 Logs:           {UI.CYAN}docker logs -f {container_name}{UI.COLOR_OFF}")
                 
@@ -1065,18 +1145,40 @@ def main():
     run = subparsers.add_parser("run")
     run.add_argument("-t", "--tag")
     run.add_argument("-r", "--root")
+    run.add_argument("-c", "--container")
     run.add_argument("--host-name")
     run.add_argument("--ssl", action="store_true", default=None)
     run.add_argument("--no-ssl", action="store_false", dest="ssl")
     run.add_argument("--port", type=int)
     run.add_argument("--es-port", type=int)
+    run.add_argument("--db", choices=["postgresql", "mysql", "hypersonic"])
+    run.add_argument("--jdbc-username")
+    run.add_argument("--jdbc-password")
+    run.add_argument("--recreate-db", action="store_true")
+    run.add_argument("--host-network", action="store_true", default=None)
+    run.add_argument("--no-host-network", action="store_false", dest="host_network")
+    run.add_argument("--release-type", choices=["any", "u", "lts", "qr"])
+    run.add_argument("--portal", action="store_true")
+    run.add_argument("--disable-zip64", action="store_true")
+    run.add_argument("--delete-state", action="store_true")
+    run.add_argument("--remove-after", action="store_true")
     run.add_argument("--refresh", action="store_true")
-    run.add_argument("--follow", action="store_true")
+    run.add_argument("-f", "--follow", action="store_true")
 
     subparsers.add_parser("snapshots")
+    
     snap = subparsers.add_parser("snapshot")
     snap.add_argument("-n", "--name")
-    subparsers.add_parser("restore")
+    snap.add_argument("--files-only", action="store_true")
+    snap.add_argument("--no-stop", action="store_true")
+    snap.add_argument("--pg-host")
+    snap.add_argument("--pg-port")
+    snap.add_argument("--my-host")
+    snap.add_argument("--my-port")
+
+    rest = subparsers.add_parser("restore")
+    rest.add_argument("-i", "--index", type=int)
+    rest.add_argument("--checkpoint")
     
     args = parser.parse_args()
     if not args.command: 
