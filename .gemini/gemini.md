@@ -1,9 +1,11 @@
 # Liferay Docker Scripts - Project Context
 
 ## Project Overview
+
 This repository contains automation tools for managing Liferay DXP instances using Docker. It provides a Python-based manager with shell and batch wrappers, along with standalone utility scripts for snapshots and restoration.
 
 ## Core Mandates
+
 - **Logic Source of Truth**: `liferay_docker.py` is the primary source of business logic for container management.
 - **Platform Parity**: Ensure that changes to `.sh` scripts (for macOS/Linux) have equivalent updates in `.bat` scripts (for Windows) where applicable.
 - **Idempotency**: All scripts must handle existing containers, volumes, and network configurations gracefully (e.g., using `docker ps -a` checks).
@@ -31,17 +33,21 @@ This repository contains automation tools for managing Liferay DXP instances usi
 - **Database Support**: Maintain support for Hypersonic (default), PostgreSQL, and MySQL.
 
 ## Engineering Standards
+
 - **Liferay Versioning**: Adhere to Liferay 7.4+ tag formats (`YYYY.qX.N`).
 - **File System Structure**: Respect the expected directory layout:
   - `deploy/`: Liferay deployment folder.
   - `files/`: Configuration files (e.g., `portal-ext.properties`).
   - `data/`: Persistent Liferay data (document library, etc.).
   - `osgi/`: Client extensions and state.
+
 ## UI & Interaction Consistency
+
 - **Background Startup**: Containers start in detached mode by default. Users must use `--follow` or `-f` to attach to logs.
 - **UI Consistency**: Use the `UI` helper class in Python and `terminal-colors.txt` in shell scripts for consistent logging.
 
 ## Definition of Done
+
 - **Manual Verification**:
   1. Run `liferay-docker.sh run` to ensure container creation and startup.
   2. Verify volume mounting by checking `files/portal-ext.properties` inside the container.
@@ -51,24 +57,29 @@ This repository contains automation tools for managing Liferay DXP instances usi
 ## Gotchas & Engineering Insights
 
 ### 1. macOS M1/M2/M3 Socket Isolation
+
 - **Issue**: Docker Desktop for Mac uses a symlink at `/var/run/docker.sock` that containers cannot follow, leading to empty "Error response from daemon" messages.
 - **Fix**: Use an `alpine/socat` sidecar container to bridge the real socket path (`~/.docker/run/docker.sock`) to a TCP endpoint within the shared Docker network.
 
 ### 2. Traefik v3 Parsing
+
 - **Issue**: Traefik v3 changed its rule parser. Using `Host("domain.com")` results in 404s or "illegal rune" errors.
 - **Fix**: Always use backticks for Host rules in labels: `Host(\`domain.com\`)`.
 
 ### 3. Docker API Negotiation
+
 - **Issue**: Modern Docker versions (v29+) have deprecated older API handshakes, which can break sidecar communication.
 - **Fix**: Explicitly set the environment variable `DOCKER_API_VERSION=1.44` for any container that needs to interact with the Docker API.
 
 ### 4. The `sudo` Environment Gap
+
 - **Issue**: Running scripts with `sudo` often clears user-level environment variables and changes `$HOME` to `/var/root`, causing path and configuration failures.
-- **Fix**: 
+- **Fix**:
   - Use `REAL_HOME=$(eval echo "~${SUDO_USER:-$USER}")` in shell scripts to find the actual user's home directory.
   - In Python, always include default values or perform existence checks (e.g., `if var and var.isdigit()`) before type casting to prevent crashes if `sudo` strips an expected variable.
 
 ### 5. Snapshotting Gotchas
+
 - **Atomic Snapshots & Volume Locking**: Stopping the container before snapshotting is critical for data integrity and host-side access. On macOS (VirtioFS), an active container can prevent tools like `tar` from reading OSGi state files or database locks.
 - **Database Pre-flighting**: Scripts must perform a "Fast-Fail" check (e.g., `SELECT 1`) via `psql` or `mysql` before starting file archival. This prevents wasting time on large file operations if the database is unreachable or credentials have expired.
 - **Standard vs. Cloud Layout**:
