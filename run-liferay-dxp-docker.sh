@@ -1,4 +1,5 @@
 #!/bin/zsh
+setopt nullglob
 
 Color_Off='\033[0m'
 Green='\033[0;32m'
@@ -22,7 +23,7 @@ if ! docker info >/dev/null 2>&1; then
 fi
 
 export DOCKER_CLI_HINTS=false
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="${0:A:h}"
 IMAGE_NAME=liferay/dxp
 PROJECT_META_FILE=".liferay-docker.meta"
 
@@ -490,8 +491,8 @@ CONTAINER_NAME=${CONTAINER_ARG:-${META_CONTAINER:-$(echo "$LIFERAY_ROOT" | sed -
 if [[ ! -d "$LIFERAY_ROOT" ]]; then
   info_custom "${Yellow}ℹ Creating ${BYellow}volume ${Yellow}folders"
   mkdir -p "$LIFERAY_ROOT"/{deploy,data,osgi/client-extensions,osgi/state,osgi/modules,files,scripts,backups}
-  cp "$SCRIPT_DIR"/common/*activationkeys.xml "$LIFERAY_ROOT/deploy"/ 2>/dev/null
-  cp "$SCRIPT_DIR"/common/*.properties "$LIFERAY_ROOT/files"/ 2>/dev/null
+  for f in "$SCRIPT_DIR"/common/*activationkeys.xml; do cp "$f" "$LIFERAY_ROOT/deploy"/ 2>/dev/null; done
+  for f in "$SCRIPT_DIR"/common/*.properties; do cp "$f" "$LIFERAY_ROOT/files"/ 2>/dev/null; done
 fi
 
 FILES_VOLUME="$LIFERAY_ROOT/files"; STATE_VOLUME="$LIFERAY_ROOT/osgi/state"
@@ -554,7 +555,7 @@ fi
   
   # Network & Traefik Labels
   TRAEFIK_LABELS=()
-  NETWORK_ARGS="-p ${RESOLVED_IP}:${LOCAL_PORT}:8080"
+  NETWORK_ARGS=("-p" "${RESOLVED_IP}:${LOCAL_PORT}:8080")
   if [[ $USE_SSL -eq 1 ]]; then
     TRAEFIK_LABELS=(
       "--label" "traefik.enable=true"
@@ -565,15 +566,15 @@ fi
       "--label" "traefik.docker.network=liferay-proxy-net"
     )
     # Use shared bridge for SSL
-    NETWORK_ARGS="--network=liferay-proxy-net $NETWORK_ARGS"
+    NETWORK_ARGS=("--network=liferay-proxy-net" "${NETWORK_ARGS[@]}")
   elif [[ "$USE_HOST_NETWORK" == "True" ]]; then
-    NETWORK_ARGS="--network=host"
+    NETWORK_ARGS=("--network=host")
   fi
 
   # ES Port logic: Skip prompt and handle busy port gracefully
   ES_PORT=${ES_PORT_ARG:-${META_ES_PORT:-9200}}
   if check_port_available "$ES_PORT" "$RESOLVED_IP"; then
-    NETWORK_ARGS="$NETWORK_ARGS -p ${RESOLVED_IP}:${ES_PORT}:9200"
+    NETWORK_ARGS+=("-p" "${RESOLVED_IP}:${ES_PORT}:9200")
   else
     info "Note: Host port $ES_PORT is busy. ES sidecar is active internally but not exposed."
   fi
@@ -590,7 +591,6 @@ fi
     if ! command -v mkcert &> /dev/null; then
       error "mkcert is not installed. SSL support will be skipped."; USE_SSL=0
     else
-      fi
       CERT_DIR="$HOME/.liferay_docker_certs"
       mkdir -p "$CERT_DIR"
       if [[ ! -f "$CERT_DIR/$HOST_NAME.pem" ]]; then
@@ -606,7 +606,7 @@ fi
   fi
 
   L_TAG="$IMAGE_NAME:$LIFERAY_TAG"; docker pull "$L_TAG"
-  docker create -it ${NETWORK_ARGS} --name "${CONTAINER_NAME}" ${JVM_OPTS:+"-e LIFERAY_JVM_OPTS=$JVM_OPTS"} "${TRAEFIK_LABELS[@]}" -v "${FILES_VOLUME}:/mnt/liferay/files" -v "$LIFERAY_ROOT/scripts:/mnt/liferay/scripts" -v "${STATE_VOLUME}:/opt/liferay/osgi/state" -v "$LIFERAY_ROOT/osgi/modules:/opt/liferay/modules" -v "$LIFERAY_ROOT/data:/opt/liferay/data" -v "$LIFERAY_ROOT/deploy:/mnt/liferay/deploy" -v "$LIFERAY_ROOT/osgi/client-extensions:/opt/liferay/osgi/client-extensions" "$L_TAG"
+  docker create -it "${NETWORK_ARGS[@]}" --name "${CONTAINER_NAME}" ${JVM_OPTS:+"-e LIFERAY_JVM_OPTS=$JVM_OPTS"} "${TRAEFIK_LABELS[@]}" -v "${FILES_VOLUME}:/mnt/liferay/files" -v "$LIFERAY_ROOT/scripts:/mnt/liferay/scripts" -v "${STATE_VOLUME}:/opt/liferay/osgi/state" -v "$LIFERAY_ROOT/osgi/modules:/opt/liferay/modules" -v "$LIFERAY_ROOT/data:/opt/liferay/data" -v "$LIFERAY_ROOT/deploy:/mnt/liferay/deploy" -v "$LIFERAY_ROOT/osgi/client-extensions:/opt/liferay/osgi/client-extensions" "$L_TAG"
 else
   info_custom "${BYELLOW}=== Resuming $CONTAINER_NAME ==="
   [[ -n "$REMOVE_AFTER_FLAG" ]] && REMOVE_CONTAINER=Y || read_config "Remove container afterwards" REMOVE_CONTAINER N

@@ -1,4 +1,5 @@
 #!/bin/zsh
+setopt nullglob
 
 set -o pipefail
 SCRIPT_VERSION="2025-11-12"
