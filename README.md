@@ -1,6 +1,15 @@
-# Liferay Docker Scripts
+# Liferay Docker Scripts (Legacy)
 
-A collection of professional automation tools for managing Liferay Portal and DXP instances using Docker. These scripts simplify container orchestration, configuration persistence, and snapshot/restoration workflows.
+> [!WARNING]
+> **Succeeded by Liferay Docker Manager (LDM)**
+> This project has evolved into a standalone application with a modular architecture, multi-instance orchestration, and advanced state management.
+>
+> **Please use the new repository for the latest features:**
+> **[https://github.com/peterrichards-lr/liferay-docker-manager](https://github.com/peterrichards-lr/liferay-docker-manager)**
+
+---
+
+A collection of automation tools for managing Liferay Portal and DXP instances using Docker. These scripts simplify container orchestration, configuration persistence, and snapshot/restoration workflows.
 
 ---
 
@@ -60,8 +69,6 @@ You can inspect the global proxy state by checking its logs:
 docker logs liferay-proxy-global
 ```
 
-_Tip: This is the first place to look if you encounter a 404 or 502 error during SSL development._
-
 ---
 
 ## Cross-Platform Networking
@@ -105,117 +112,7 @@ When starting an instance in background mode (default), the script will:
 - **mkcert**: (Optional) Required for automated local SSL termination.
 - **Database Clients**: (Optional) If using PostgreSQL or MySQL, ensure the respective client (`psql` or `mysql`) is installed and available in your system PATH for snapshot/restore operations.
 
-> [!TIP]
-> While the specialized shell scripts require Zsh, the primary Python-based manager can be run using the standard Bash wrapper `./liferay-docker.sh` on environments where Zsh is not available.
-
 ---
-
-## Quick Start Examples
-
-### 1. Run a Standard DXP Instance
-
-Launch a Liferay DXP instance on the default port (8080) with Hypersonic:
-
-```bash
-./liferay-docker.sh run --tag 2025.q4.11
-```
-
-_Note: The container starts in the background. The script will provide direct `docker logs -f <name>`, access URL, and `docker rm -f <name>` commands upon successful startup._
-
-### 2. Run a Liferay Portal Instance
-
-Use the `--portal` flag to switch to the open-source Liferay Portal image:
-
-```bash
-./liferay-docker.sh run --portal
-```
-
-### 3. Running Multiple Isolated Instances
-
-Use unique virtual hostnames and loopback IPs to run instances side-by-side on the **same port**:
-
-```bash
-# Instance A (on 127.0.0.1:8080)
-./liferay-docker.sh run --host-name portal-a.local -p 8080
-
-# Instance B (on 127.0.0.74:8080)
-./liferay-docker.sh run --host-name portal-b.local -p 8080
-```
-
-_Note: Ensure your `hosts` file maps these domains to the respective loopback IPs. See [hosts.example](hosts.example)._
-
-### 4. Create and Restore Snapshots
-
-```bash
-# Create a standard snapshot
-./liferay-docker.sh snapshot --name "Pre-Upgrade Backup"
-
-# View available snapshots
-./liferay-docker.sh snapshots
-
-# Restore the latest snapshot
-./liferay-docker.sh restore
-```
-
-_Note: Snapshot and restore commands use **Smart Root detection**. If run outside a Liferay project, they will automatically scan subdirectories and offer an interactive selection of managed folders._
-
----
-
-## Command Reference
-
-### `run` command options
-
-| Option               | Description                                                             | Default          |
-| :------------------- | :---------------------------------------------------------------------- | :--------------- |
-| `-t, --tag <tag>`    | Docker image tag (e.g., `2024.q1.5`).                                   | Latest available |
-| `--portal`           | Use Liferay Portal (`liferay/portal`) instead of DXP.                   | DXP              |
-| `-r, --root <path>`  | Project root directory.                                                 | `./<tag>`        |
-| `--host-name <host>` | Virtual hostname (e.g., `liferay.local`). Enables session isolation.    | `localhost`      |
-| `-p, --port <port>`  | Local HTTP port mapping.                                                | `8080`           |
-| `--es-port <port>`   | Elasticsearch sidecar HTTP port.                                        | `9200`           |
-| `--db <type>`        | Database type: `postgresql`, `mysql`, or `hypersonic`.                  | `hypersonic`     |
-| `--disable-zip64`    | Disable JVM Zip64 extra field validation.                               | Enabled          |
-| `--select`           | Browse and select from existing managed folders.                        | N/A              |
-| `--refresh`          | Force refresh of the Docker Hub tag cache.                              | N/A              |
-| `--ssl`              | Enable SSL with Traefik and mkcert (auto-enabled for custom hostnames). | N/A              |
-| `--no-ssl`           | Explicitly disable SSL support.                                         | N/A              |
-| `-f, --follow`       | Start container and automatically follow logs.                          | Background only  |
-| `--remove-after`     | Automatically remove the container after it stops.                      | Off              |
-
----
-
-## Advanced Features
-
-### Virtual Host & Session Isolation
-
-When using `--host-name`, the scripts automatically:
-
-1. **Rename Cookies:** Sets a unique `SESSION_COOKIE_NAME` (e.g., `LFR_SESSION_ID_portal_a_local`) to prevent cross-instance logouts.
-2. **Domain Scoping:** Configures Liferay to scope cookies to the specific virtual domain.
-3. **Security Whitelisting:** Adds the hostname and resolved IP to `virtual.hosts.valid.hosts` to prevent 403 Forbidden errors.
-
-### Proactive Collision Detection
-
-The scripts perform "Fast-Fail" checks before starting a container to prevent environment corruption:
-
-- **DNS/Binding Verification:** Ensures custom hostnames resolve to a bindable `127.x.x.x` loopback address.
-- **Port Conflict Detection:** Detects if the requested HTTP or Elasticsearch port is already occupied on the **same loopback IP** by another running Liferay container.
-- **Database Collision Detection:** Parses and normalizes JDBC URLs from `portal-ext.properties` to warn you if two instances are attempting to use the **exact same database schema** on the same server.
-
----
-
-## SSL Setup (Green Lock)
-
-To enable locally trusted HTTPS for your development instances:
-
-1. **Install mkcert**: `brew install mkcert` (macOS) or `choco install mkcert` (Windows).
-2. **Install Root CA**: Run `mkcert -install` to trust the local certificate authority.
-3. **Use a Custom Hostname**: Provide a `--host-name` (e.g., `prospect.demo`) when running the script.
-
-## Issues & Contributions
-
-Notice a bug or have a feature request? We welcome contributions! Please report any issues on our GitHub tracker:
-[https://github.com/peterrichards-lr/liferay-docker-scripts](https://github.com/peterrichards-lr/liferay-docker-scripts)
 
 ## License
 
